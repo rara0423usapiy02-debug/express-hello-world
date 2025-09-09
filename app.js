@@ -15,7 +15,6 @@ const rabbitImages = [
     "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564052000.jpg",
     "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564052001.jpg",
     "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564052002.jpg"
-    // •¡”‚ ‚ê‚Î‚±‚±‚É’Ç‰Á
 ];
 
 app.get("/", (_, res) => {
@@ -23,7 +22,7 @@ app.get("/", (_, res) => {
 });
 
 app.post("/webhook", (req, res) => {
-    // LINE ‚É 200 OK ‚ğ‚·‚®•Ô‚·i‚±‚ê‚ğ‚µ‚È‚¢‚ÆÄ‘—‚³‚ê‚éj
+    // LINE ‚É 200 OK ‚ğ‘¦•Ô‚·
     res.status(200).end();
 
     console.log("Webhook event:", JSON.stringify(req.body, null, 2));
@@ -31,7 +30,8 @@ app.post("/webhook", (req, res) => {
     const event = req.body.events[0];
 
     if (event.type === "message" && event.message.type === "text") {
-        const userMessage = event.message.text;
+        // •¶š—ñ‚ğ³‹K‰»‚µ‚Ä”äŠri‘SŠp”¼Šp‚âƒ[ƒ••¶š‘Îôj
+        const userMessage = event.message.text.trim().normalize("NFKC");
         let messages = [];
 
         if (userMessage === "test") {
