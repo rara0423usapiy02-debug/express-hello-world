@@ -30,8 +30,9 @@ app.post("/webhook", (req, res) => {
     const event = req.body.events[0];
 
     if (event.type === "message" && event.message.type === "text") {
-        // 文字列を正規化して比較（全角半角やゼロ幅文字対策）
-        const userMessage = event.message.text.trim().normalize("NFKC");
+        const userMessage = event.message.text.trim();
+        console.log("User message:", userMessage);
+
         let messages = [];
 
         if (userMessage === "test") {
@@ -40,8 +41,8 @@ app.post("/webhook", (req, res) => {
                 { type: "text", text: "Hello, user" },
                 { type: "text", text: "May I help you?" },
             ];
-        } else if (userMessage === "うさぎ") {
-            // 「うさぎ」の場合はランダム画像返信
+        } else if (/うさぎ/.test(userMessage)) {
+            // 「うさぎ」が含まれている場合はランダム画像返信
             const randomImage = rabbitImages[Math.floor(Math.random() * rabbitImages.length)];
             messages = [
                 {
@@ -51,7 +52,7 @@ app.post("/webhook", (req, res) => {
                 }
             ];
         } else {
-            console.log("No reply sent (message was not 'test' or 'うさぎ').");
+            console.log("No reply sent (message was neither 'test' nor 'うさぎ').");
             return;
         }
 
