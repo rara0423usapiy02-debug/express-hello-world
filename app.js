@@ -25,24 +25,24 @@ app.post("/webhook", (req, res) => {
     // LINE に 200 OK を即返す
     res.status(200).end();
 
-    console.log("Webhook event:", JSON.stringify(req.body, null, 2));
-
     const event = req.body.events[0];
 
     if (event.type === "message" && event.message.type === "text") {
         const userMessage = event.message.text.trim();
         console.log("User message:", userMessage);
+        console.log("Char codes:", Array.from(userMessage).map(c => c.charCodeAt(0)));
 
         let messages = [];
 
+        // テキスト "test" に反応
         if (userMessage === "test") {
-            // 「test」の場合はテキスト返信
             messages = [
                 { type: "text", text: "Hello, user" },
                 { type: "text", text: "May I help you?" },
             ];
-        } else if (/うさぎ/.test(userMessage)) {
-            // 「うさぎ」が含まれている場合はランダム画像返信
+        }
+        // 「うさぎ」を含む場合にランダム画像返信
+        else if (userMessage.match(/うさぎ/)) {
             const randomImage = rabbitImages[Math.floor(Math.random() * rabbitImages.length)];
             messages = [
                 {
@@ -56,7 +56,7 @@ app.post("/webhook", (req, res) => {
             return;
         }
 
-        // LINE API に返信リクエストを送信
+        // LINE API に返信
         const headers = {
             "Content-Type": "application/json",
             "Authorization": "Bearer " + TOKEN,
