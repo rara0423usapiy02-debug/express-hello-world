@@ -8,7 +8,7 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// うさぎ画像のURLリスト（GitHubの raw URL を利用）
+// 画像のURLリスト（GitHubの raw URL を利用）
 const rabbitImages = [
     "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564051997_0.jpg",
     "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564051999_0.jpg",
@@ -41,8 +41,8 @@ app.post("/webhook", (req, res) => {
                 { type: "text", text: "May I help you?" },
             ];
         }
-        // 「うさぎ」を含む場合にランダム画像返信
-        else if (userMessage.match(/うさぎ/)) {
+        // 「huku」を含む場合にランダム画像返信
+        else if (userMessage.match(/huku/)) {
             const randomImage = rabbitImages[Math.floor(Math.random() * rabbitImages.length)];
             messages = [
                 {
@@ -52,7 +52,7 @@ app.post("/webhook", (req, res) => {
                 }
             ];
         } else {
-            console.log("No reply sent (message was neither 'test' nor 'うさぎ').");
+            console.log("No reply sent (message was neither 'test' nor 'huku').");
             return;
         }
 
