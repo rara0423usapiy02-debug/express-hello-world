@@ -37,14 +37,17 @@ const createFaqListFlex = () => ({
             type: "box",
             layout: "vertical",
             contents: [
-                { type: "text", text: "💒 結婚式 FAQ", weight: "bold", size: "lg", align: "center", color: "#C19A6B" },
+                // FAQタイトル：白いハトアイコンに変更
+                { type: "text", text: "🕊️ 結婚式 FAQ", weight: "bold", size: "lg", align: "center", color: "#C19A6B" },
                 { type: "separator", margin: "md", color: "#E6C9C9" },
                 ...Object.keys(faqData).map((key, i) => ({
                     type: "button",
                     style: "primary",
                     color: ["#FADADD", "#D5E8D4", "#DDEBF7"][i % 3],
-                    action: { type: "message", label: "🌸 " + faqData[key].q, text: "FAQ:" + key },
-                    margin: "sm"
+                    action: { type: "message", label: faqData[key].q, text: "FAQ:" + key },
+                    margin: "sm",
+                    // ボタン文字色を黒に指定
+                    color: "#000000"
                 }))
             ]
         }
