@@ -5,7 +5,7 @@ const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.LINE_ACCESS_TOKEN;
 const app = express();
 
-// 画像のURLリスト（例: うさぎ画像）
+// 画像URLリスト
 const rabbitImages = [
     "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564051997_0.jpg",
     "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564051999_0.jpg",
@@ -17,7 +17,7 @@ const rabbitImages = [
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// FAQデータ（結婚式参列者向け）
+// FAQデータ
 const faqData = {
     "駐車場": {
         q: "駐車場はありますか？",
@@ -41,144 +41,108 @@ const faqData = {
     }
 };
 
-// FAQリストFlex（丸ボタン＋花アイコン、優しい配色）
-const faqListFlex = {
+// ===== FAQ関連関数 =====
+const createFaqListFlex = () => ({
     type: "flex",
     altText: "結婚式FAQリスト",
     contents: {
         type: "bubble",
-        styles: { body: { backgroundColor: "#FFF0F5" } }, // 淡いピンク
+        styles: { body: { backgroundColor: "#FFF0F5" } },
         body: {
             type: "box",
             layout: "vertical",
             contents: [
-                {
-                    type: "text",
-                    text: "💒 結婚式 FAQ",
-                    weight: "bold",
-                    size: "lg",
-                    align: "center",
-                    color: "#C19A6B"
-                },
+                { type: "text", text: "💒 結婚式 FAQ", weight: "bold", size: "lg", align: "center", color: "#C19A6B" },
                 { type: "separator", margin: "md", color: "#E6C9C9" },
                 ...Object.keys(faqData).map((key, i) => ({
                     type: "button",
                     style: "primary",
                     color: ["#FADADD", "#D5E8D4", "#DDEBF7"][i % 3],
-                    action: {
-                        type: "message",
-                        label: "🌸 " + faqData[key].q, // 花アイコン追加
-                        text: "FAQ:" + key
-                    },
+                    action: { type: "message", label: "🌸 " + faqData[key].q, text: "FAQ:" + key },
                     margin: "sm",
-                    cornerRadius: "md" // 角丸
+                    cornerRadius: "md"
                 }))
-            ]
-        }
-    }
-};
-
-// 個別FAQ回答Flex（丸み＋優しい配色）
-const makeFaqAnswerFlex = (key) => ({
-    type: "flex",
-    altText: faqData[key].q,
-    contents: {
-        type: "bubble",
-        styles: { body: { backgroundColor: "#FFFAF0" } }, // アイボリー系
-        body: {
-            type: "box",
-            layout: "vertical",
-            contents: [
-                {
-                    type: "text",
-                    text: "Q. " + faqData[key].q,
-                    weight: "bold",
-                    size: "md",
-                    color: "#C19A6B"
-                },
-                {
-                    type: "text",
-                    text: "A. " + faqData[key].a,
-                    wrap: true,
-                    size: "sm",
-                    margin: "md",
-                    color: "#333333"
-                }
             ]
         }
     }
 });
 
+const createFaqAnswerFlex = (key) => ({
+    type: "flex",
+    altText: faqData[key].q,
+    contents: {
+        type: "bubble",
+        styles: { body: { backgroundColor: "#FFFAF0" } },
+        body: {
+            type: "box",
+            layout: "vertical",
+            contents: [
+                { type: "text", text: "Q. " + faqData[key].q, weight: "bold", size: "md", color: "#C19A6B" },
+                { type: "text", text: "A. " + faqData[key].a, wrap: true, size: "sm", margin: "md", color: "#333333" }
+            ]
+        }
+    }
+});
+
+// ===== HUKU（画像）関連関数 =====
+const createRandomRabbitImage = () => {
+    const randomImage = rabbitImages[Math.floor(Math.random() * rabbitImages.length)];
+    return [{
+        type: "image",
+        originalContentUrl: randomImage,
+        previewImageUrl: randomImage
+    }];
+};
+
+// ===== メッセージ処理関数 =====
+const handleMessage = (userMessage) => {
+    userMessage = userMessage.trim();
+    if (/^faq$/i.test(userMessage)) {
+        return [createFaqListFlex()];
+    } else if (/^FAQ:/i.test(userMessage)) {
+        const key = userMessage.replace(/^FAQ:/i, "").trim();
+        return faqData[key] ? [createFaqAnswerFlex(key)] : [{ type: "text", text: "その質問には対応していません。" }];
+    } else if (/huku/i.test(userMessage)) {
+        return createRandomRabbitImage();
+    } else if (userMessage === "test") {
+        return [
+            { type: "text", text: "Hello, user" },
+            { type: "text", text: "May I help you?" }
+        ];
+    } else {
+        return null;
+    }
+};
+
+// ===== Expressルート =====
 app.get("/", (_, res) => res.sendStatus(200));
 
 app.post("/webhook", (req, res) => {
-    res.status(200).end(); // LINEにすぐ200を返す
-
+    res.status(200).end(); // LINEに即応答
     const events = req.body.events || [];
+
     events.forEach(event => {
         if (event.type === "message" && event.message.type === "text") {
-            const userMessage = event.message.text.trim();
-            console.log("User message:", userMessage);
+            const messages = handleMessage(event.message.text);
+            if (!messages) return console.log("No reply sent.");
 
-            let messages = [];
-
-            // FAQリスト（大文字/小文字どちらも対応）
-            if (userMessage.toLowerCase() === "faq") {
-                messages = [faqListFlex];
-            }
-            // 個別FAQ
-            else if (userMessage.startsWith("FAQ:")) {
-                const key = userMessage.replace("FAQ:", "").trim();
-                messages = faqData[key]
-                    ? [makeFaqAnswerFlex(key)]
-                    : [{ type: "text", text: "その質問には対応していません。" }];
-            }
-            // デモ用: test
-            else if (userMessage === "test") {
-                messages = [
-                    { type: "text", text: "Hello, user" },
-                    { type: "text", text: "May I help you?" }
-                ];
-            }
-            // 「huku」含む場合はランダム画像
-            else if (userMessage.match(/huku/i)) {
-                const randomImage = rabbitImages[Math.floor(Math.random() * rabbitImages.length)];
-                messages = [{
-                    type: "image",
-                    originalContentUrl: randomImage,
-                    previewImageUrl: randomImage
-                }];
-            } else {
-                console.log("No reply sent.");
-                return;
-            }
-
-            // LINE API送信
-            const headers = {
-                "Content-Type": "application/json",
-                "Authorization": "Bearer " + TOKEN,
-            };
-
-            const dataString = JSON.stringify({
-                replyToken: event.replyToken,
-                messages: messages,
-            });
+            const headers = { "Content-Type": "application/json", "Authorization": "Bearer " + TOKEN };
+            const dataString = JSON.stringify({ replyToken: event.replyToken, messages });
 
             const webhookOptions = {
                 hostname: "api.line.me",
                 path: "/v2/bot/message/reply",
                 method: "POST",
-                headers: headers,
+                headers
             };
 
             const request = https.request(webhookOptions, (response) => {
                 let body = "";
-                response.on("data", (chunk) => { body += chunk; });
-                response.on("end", () => { console.log("LINE API response:", body); });
+                response.on("data", chunk => body += chunk);
+                response.on("end", () => console.log("LINE API response:", body));
             });
 
-            request.on("error", (err) => console.error("Request error:", err));
-
+            request.on("error", err => console.error("Request error:", err));
             request.write(dataString);
             request.end();
         }
