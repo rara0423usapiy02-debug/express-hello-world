@@ -1,112 +1,18 @@
-﻿//const https = require("https");
-//const express = require("express");
-
-//const PORT = process.env.PORT || 3000;
-//const TOKEN = process.env.LINE_ACCESS_TOKEN;
-//const app = express();
-
-//app.use(express.json());
-//app.use(express.urlencoded({ extended: true }));
-
-//// 画像のURLリスト（GitHubの raw URL を利用）
-//const rabbitImages = [
-//    "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564051997_0.jpg",
-//    "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564051999_0.jpg",
-//    "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564052000.jpg",
-//    "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564052001.jpg",
-//    "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564052002.jpg"
-//];
-
-//app.get("/", (_, res) => {
-//    res.sendStatus(200);
-//});
-
-//app.post("/webhook", (req, res) => {
-//    // LINE に 200 OK を即返す
-//    res.status(200).end();
-
-//    const event = req.body.events[0];
-
-//    if (event.type === "message" && event.message.type === "text") {
-//        const userMessage = event.message.text.trim();
-//        console.log("User message:", userMessage);
-//        console.log("Char codes:", Array.from(userMessage).map(c => c.charCodeAt(0)));
-
-//        let messages = [];
-
-//        // テキスト "test" に反応
-//        if (userMessage === "test") {
-//            messages = [
-//                { type: "text", text: "Hello, user" },
-//                { type: "text", text: "May I help you?" },
-//            ];
-//        }
-//        // 「huku」を含む場合にランダム画像返信
-//        else if (userMessage.match(/huku/)) {
-//            const randomImage = rabbitImages[Math.floor(Math.random() * rabbitImages.length)];
-//            messages = [
-//                {
-//                    type: "image",
-//                    originalContentUrl: randomImage,
-//                    previewImageUrl: randomImage
-//                }
-//            ];
-//        } else {
-//            console.log("No reply sent (message was neither 'test' nor 'huku').");
-//            return;
-//        }
-
-//        // LINE API に返信
-//        const headers = {
-//            "Content-Type": "application/json",
-//            "Authorization": "Bearer " + TOKEN,
-//        };
-
-//        const dataString = JSON.stringify({
-//            replyToken: event.replyToken,
-//            messages: messages,
-//        });
-
-//        console.log("Request body to LINE API:", dataString);
-
-//        const webhookOptions = {
-//            hostname: "api.line.me",
-//            path: "/v2/bot/message/reply",
-//            method: "POST",
-//            headers: headers,
-//        };
-
-//        const request = https.request(webhookOptions, (response) => {
-//            let body = "";
-//            console.log("LINE API status code:", response.statusCode);
-
-//            response.on("data", (chunk) => {
-//                body += chunk;
-//            });
-
-//            response.on("end", () => {
-//                console.log("LINE API response body:", body);
-//            });
-//        });
-
-//        request.on("error", (err) => {
-//            console.error("Request error:", err);
-//        });
-
-//        request.write(dataString);
-//        request.end();
-//    }
-//});
-
-//app.listen(PORT, () => {
-//    console.log(`Example app listening at http://localhost:${PORT}`);
-//});
-const https = require("https");
+﻿const https = require("https");
 const express = require("express");
 
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.LINE_ACCESS_TOKEN;
 const app = express();
+
+// 画像のURLリスト（例: うさぎ画像）
+const rabbitImages = [
+    "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564051997_0.jpg",
+    "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564051999_0.jpg",
+    "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564052000.jpg",
+    "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564052001.jpg",
+    "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564052002.jpg"
+];
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -135,12 +41,13 @@ const faqData = {
     }
 };
 
-// 質問一覧（FAQリスト）を作るFlex Message
+// FAQリストFlex（丸ボタン＋花アイコン、優しい配色）
 const faqListFlex = {
     type: "flex",
     altText: "結婚式FAQリスト",
     contents: {
         type: "bubble",
+        styles: { body: { backgroundColor: "#FFF0F5" } }, // 淡いピンク
         body: {
             type: "box",
             layout: "vertical",
@@ -150,33 +57,34 @@ const faqListFlex = {
                     text: "💒 結婚式 FAQ",
                     weight: "bold",
                     size: "lg",
-                    align: "center"
+                    align: "center",
+                    color: "#C19A6B"
                 },
-                {
-                    type: "separator",
-                    margin: "md"
-                },
-                ...Object.keys(faqData).map(key => ({
+                { type: "separator", margin: "md", color: "#E6C9C9" },
+                ...Object.keys(faqData).map((key, i) => ({
                     type: "button",
-                    style: "secondary",
+                    style: "primary",
+                    color: ["#FADADD", "#D5E8D4", "#DDEBF7"][i % 3],
                     action: {
                         type: "message",
-                        label: faqData[key].q,
+                        label: "🌸 " + faqData[key].q, // 花アイコン追加
                         text: "FAQ:" + key
                     },
-                    margin: "sm"
+                    margin: "sm",
+                    cornerRadius: "md" // 角丸
                 }))
             ]
         }
     }
 };
 
-// 特定の質問と回答を返すFlex Message
+// 個別FAQ回答Flex（丸み＋優しい配色）
 const makeFaqAnswerFlex = (key) => ({
     type: "flex",
     altText: faqData[key].q,
     contents: {
         type: "bubble",
+        styles: { body: { backgroundColor: "#FFFAF0" } }, // アイボリー系
         body: {
             type: "box",
             layout: "vertical",
@@ -185,101 +93,96 @@ const makeFaqAnswerFlex = (key) => ({
                     type: "text",
                     text: "Q. " + faqData[key].q,
                     weight: "bold",
-                    size: "md"
+                    size: "md",
+                    color: "#C19A6B"
                 },
                 {
                     type: "text",
                     text: "A. " + faqData[key].a,
                     wrap: true,
                     size: "sm",
-                    margin: "md"
+                    margin: "md",
+                    color: "#333333"
                 }
             ]
         }
     }
 });
 
-app.get("/", (_, res) => {
-    res.sendStatus(200);
-});
+app.get("/", (_, res) => res.sendStatus(200));
 
 app.post("/webhook", (req, res) => {
     res.status(200).end(); // LINEにすぐ200を返す
 
-    const event = req.body.events[0];
+    const events = req.body.events || [];
+    events.forEach(event => {
+        if (event.type === "message" && event.message.type === "text") {
+            const userMessage = event.message.text.trim();
+            console.log("User message:", userMessage);
 
-    if (event.type === "message" && event.message.type === "text") {
-        const userMessage = event.message.text.trim();
-        console.log("User message:", userMessage);
+            let messages = [];
 
-        let messages = [];
-
-        // 「faq」と送信されたらFAQリストを返す
-        if (userMessage.toLowerCase() === "faq") {
-            messages = [faqListFlex];
-        }
-        // 「FAQ:〇〇」で始まる場合 → 個別の回答を返す
-        else if (userMessage.startsWith("FAQ:")) {
-            const key = userMessage.replace("FAQ:", "").trim();
-            if (faqData[key]) {
-                messages = [makeFaqAnswerFlex(key)];
-            } else {
-                messages = [{ type: "text", text: "その質問には対応していません。" }];
+            // FAQリスト（大文字/小文字どちらも対応）
+            if (userMessage.toLowerCase() === "faq") {
+                messages = [faqListFlex];
             }
-        }
-        // デモ用: test
-        else if (userMessage === "test") {
-            messages = [
-                { type: "text", text: "Hello, user" },
-                { type: "text", text: "May I help you?" }
-            ];
-        } else {
-            console.log("No reply sent (message did not match).");
-            return;
-        }
+            // 個別FAQ
+            else if (userMessage.startsWith("FAQ:")) {
+                const key = userMessage.replace("FAQ:", "").trim();
+                messages = faqData[key]
+                    ? [makeFaqAnswerFlex(key)]
+                    : [{ type: "text", text: "その質問には対応していません。" }];
+            }
+            // デモ用: test
+            else if (userMessage === "test") {
+                messages = [
+                    { type: "text", text: "Hello, user" },
+                    { type: "text", text: "May I help you?" }
+                ];
+            }
+            // 「huku」含む場合はランダム画像
+            else if (userMessage.match(/huku/i)) {
+                const randomImage = rabbitImages[Math.floor(Math.random() * rabbitImages.length)];
+                messages = [{
+                    type: "image",
+                    originalContentUrl: randomImage,
+                    previewImageUrl: randomImage
+                }];
+            } else {
+                console.log("No reply sent.");
+                return;
+            }
 
-        // LINE APIに送信
-        const headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + TOKEN,
-        };
+            // LINE API送信
+            const headers = {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + TOKEN,
+            };
 
-        const dataString = JSON.stringify({
-            replyToken: event.replyToken,
-            messages: messages,
-        });
-
-        console.log("Request body to LINE API:", dataString);
-
-        const webhookOptions = {
-            hostname: "api.line.me",
-            path: "/v2/bot/message/reply",
-            method: "POST",
-            headers: headers,
-        };
-
-        const request = https.request(webhookOptions, (response) => {
-            let body = "";
-            console.log("LINE API status code:", response.statusCode);
-
-            response.on("data", (chunk) => {
-                body += chunk;
+            const dataString = JSON.stringify({
+                replyToken: event.replyToken,
+                messages: messages,
             });
 
-            response.on("end", () => {
-                console.log("LINE API response body:", body);
+            const webhookOptions = {
+                hostname: "api.line.me",
+                path: "/v2/bot/message/reply",
+                method: "POST",
+                headers: headers,
+            };
+
+            const request = https.request(webhookOptions, (response) => {
+                let body = "";
+                response.on("data", (chunk) => { body += chunk; });
+                response.on("end", () => { console.log("LINE API response:", body); });
             });
-        });
 
-        request.on("error", (err) => {
-            console.error("Request error:", err);
-        });
+            request.on("error", (err) => console.error("Request error:", err));
 
-        request.write(dataString);
-        request.end();
-    }
+            request.write(dataString);
+            request.end();
+        }
+    });
 });
 
-app.listen(PORT, () => {
-    console.log(`Example app listening at http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`Example app listening at http://localhost:${PORT}`));
