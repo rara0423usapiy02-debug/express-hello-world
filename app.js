@@ -38,7 +38,7 @@ const createFaqListFlex = () => ({
             layout: "vertical",
             contents: [
                 // FAQタイトル：白いハトアイコン
-                { type: "text", text: "🕊️ 結婚式 FAQ", weight: "bold", size: "lg", align: "center", color: "#C19A6B" },
+                { type: "text", text: " 結婚式 FAQ 🕊️", weight: "bold", size: "lg", align: "center", color: "#C19A6B" },
                 { type: "separator", margin: "md", color: "#E6C9C9" },
                 ...Object.keys(faqData).map((key, i) => ({
                     type: "button",
