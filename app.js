@@ -37,13 +37,13 @@ const createFaqListFlex = () => ({
             type: "box",
             layout: "vertical",
             contents: [
-                // FAQタイトル：白いハトアイコンに変更
+                // FAQタイトル：白いハトアイコン
                 { type: "text", text: "🕊️ 結婚式 FAQ", weight: "bold", size: "lg", align: "center", color: "#C19A6B" },
                 { type: "separator", margin: "md", color: "#E6C9C9" },
                 ...Object.keys(faqData).map((key, i) => ({
                     type: "button",
                     style: "primary",
-                    color: ["#FADADD", "#D5E8D4", "#DDEBF7"][i % 3],
+                    color: ["#FADADD", "#D5E8D4", "#DDEBF7"][i % 3], // 元の背景色
                     action: { type: "message", label: faqData[key].q, text: "FAQ:" + key },
                     margin: "sm",
                     // ボタン文字色を黒に指定
