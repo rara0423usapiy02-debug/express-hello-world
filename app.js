@@ -42,12 +42,10 @@ const createFaqListFlex = () => ({
                 { type: "separator", margin: "md", color: "#E6C9C9" },
                 ...Object.keys(faqData).map((key, i) => ({
                     type: "button",
-                    style: "primary",
-                    color: ["#FADADD", "#D5E8D4", "#DDEBF7"][i % 3], // 元の背景色
+                    style: "secondary", // 文字色を黒にする
+                    color: ["#FADADD", "#D5E8D4", "#DDEBF7"][i % 3], // 背景色
                     action: { type: "message", label: faqData[key].q, text: "FAQ:" + key },
-                    margin: "sm",
-                    // ボタン文字色を黒に指定
-                    color: "#000000"
+                    margin: "sm"
                 }))
             ]
         }
