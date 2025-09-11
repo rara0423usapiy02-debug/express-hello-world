@@ -19,26 +19,11 @@ app.use(express.urlencoded({ extended: true }));
 
 // FAQデータ
 const faqData = {
-    "駐車場": {
-        q: "駐車場はありますか？",
-        a: "会場専用の駐車場をご利用いただけます。満車の場合は近隣のコインパーキングをご案内いたします。"
-    },
-    "服装": {
-        q: "服装の指定はありますか？",
-        a: "平服でお越しください。男性はスーツ、女性はセミフォーマルがおすすめです。白いドレスは花嫁と重なるためご遠慮ください。"
-    },
-    "ご祝儀": {
-        q: "ご祝儀はどうすればいいですか？",
-        a: "受付にてお渡しください。袱紗に包んでご持参いただけると丁寧です。"
-    },
-    "受付時間": {
-        q: "受付は何時から始まりますか？",
-        a: "挙式の30分前から受付を開始いたします。混雑が予想されますのでお早めにお越しください。"
-    },
-    "写真撮影": {
-        q: "写真撮影はしてもいいですか？",
-        a: "挙式中はご遠慮いただき、披露宴中は自由に撮影いただけます。SNS投稿の際は新郎新婦にご確認ください。"
-    }
+    "駐車場": { q: "駐車場はありますか？", a: "会場専用の駐車場をご利用いただけます。満車の場合は近隣のコインパーキングをご案内いたします。" },
+    "服装": { q: "服装の指定はありますか？", a: "平服でお越しください。男性はスーツ、女性はセミフォーマルがおすすめです。白いドレスは花嫁と重なるためご遠慮ください。" },
+    "ご祝儀": { q: "ご祝儀はどうすればいいですか？", a: "受付にてお渡しください。袱紗に包んでご持参いただけると丁寧です。" },
+    "受付時間": { q: "受付は何時から始まりますか？", a: "挙式の30分前から受付を開始いたします。混雑が予想されますのでお早めにお越しください。" },
+    "写真撮影": { q: "写真撮影はしてもいいですか？", a: "挙式中はご遠慮いただき、披露宴中は自由に撮影いただけます。SNS投稿の際は新郎新婦にご確認ください。" }
 };
 
 // ===== FAQ関連関数 =====
@@ -59,8 +44,7 @@ const createFaqListFlex = () => ({
                     style: "primary",
                     color: ["#FADADD", "#D5E8D4", "#DDEBF7"][i % 3],
                     action: { type: "message", label: "🌸 " + faqData[key].q, text: "FAQ:" + key },
-                    margin: "sm",
-                    cornerRadius: "md"
+                    margin: "sm"
                 }))
             ]
         }
@@ -87,38 +71,27 @@ const createFaqAnswerFlex = (key) => ({
 // ===== HUKU（画像）関連関数 =====
 const createRandomRabbitImage = () => {
     const randomImage = rabbitImages[Math.floor(Math.random() * rabbitImages.length)];
-    return [{
-        type: "image",
-        originalContentUrl: randomImage,
-        previewImageUrl: randomImage
-    }];
+    return [{ type: "image", originalContentUrl: randomImage, previewImageUrl: randomImage }];
 };
 
 // ===== メッセージ処理関数 =====
 const handleMessage = (userMessage) => {
     userMessage = userMessage.trim();
-    if (/^faq$/i.test(userMessage)) {
-        return [createFaqListFlex()];
-    } else if (/^FAQ:/i.test(userMessage)) {
+    if (/^faq$/i.test(userMessage)) return [createFaqListFlex()];
+    if (/^FAQ:/i.test(userMessage)) {
         const key = userMessage.replace(/^FAQ:/i, "").trim();
         return faqData[key] ? [createFaqAnswerFlex(key)] : [{ type: "text", text: "その質問には対応していません。" }];
-    } else if (/huku/i.test(userMessage)) {
-        return createRandomRabbitImage();
-    } else if (userMessage === "test") {
-        return [
-            { type: "text", text: "Hello, user" },
-            { type: "text", text: "May I help you?" }
-        ];
-    } else {
-        return null;
     }
+    if (/huku/i.test(userMessage)) return createRandomRabbitImage();
+    if (userMessage === "test") return [{ type: "text", text: "Hello, user" }, { type: "text", text: "May I help you?" }];
+    return null;
 };
 
 // ===== Expressルート =====
 app.get("/", (_, res) => res.sendStatus(200));
 
 app.post("/webhook", (req, res) => {
-    res.status(200).end(); // LINEに即応答
+    res.status(200).end();
     const events = req.body.events || [];
 
     events.forEach(event => {
@@ -129,12 +102,7 @@ app.post("/webhook", (req, res) => {
             const headers = { "Content-Type": "application/json", "Authorization": "Bearer " + TOKEN };
             const dataString = JSON.stringify({ replyToken: event.replyToken, messages });
 
-            const webhookOptions = {
-                hostname: "api.line.me",
-                path: "/v2/bot/message/reply",
-                method: "POST",
-                headers
-            };
+            const webhookOptions = { hostname: "api.line.me", path: "/v2/bot/message/reply", method: "POST", headers };
 
             const request = https.request(webhookOptions, (response) => {
                 let body = "";
