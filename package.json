@@ -7,9 +7,9 @@
   "author": "Render Developers",
   "license": "MIT",
   "private": false,
-  "scripts": {
-    "start": "node app.js"
-  },
+"scripts": {
+  "start": "node app.js"
+},
   "dependencies": {
     "axios": "^1.7.0",
     "EsLint": "npm:eslint@^9.35.0",
