@@ -1,6 +1,7 @@
-﻿// app.js - LINE Messaging API webhook（同期処理・最終完全版）
-// - 同期処理：1リクエスト内でイベントを逐次処理し、完了後に200返却
-// - ユーザー/グループ単位の直列化（リクエストをまたいでも順序保証）
+﻿// app.js - LINE Messaging API webhook（同期処理・ダブルタップ抑止・最終完全版）
+// - 同期処理：1リクエスト内で逐次処理→完了後に200返却
+// - 同一ユーザー/グループで直列化（リクエストをまたいでも順序保証）
+// - ダブルタップ抑止（サーバ側デバウンス：同一ペイロードを一定時間1回に制限）
 // - 署名検証（STRICT_SIGNATURE=true で無効署名は403）
 // - Keep-Alive（LINE API接続高速化）
 // - 重複配送デデュープ（webhookEventId/Redelivery）
@@ -8,7 +9,6 @@
 // - 構造化ログ（相関ID, elapsed ms）
 // - 健康チェック(/health)・疎通(/webhook GET)
 // - 既存応答：faq / FAQ:<key> / huku / test
-
 "use strict";
 
 const express = require("express");
@@ -25,6 +25,8 @@ const TOKEN = process.env.LINE_ACCESS_TOKEN;               // 必須
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;     // 推奨
 const STRICT_SIGNATURE = /^true$/i.test(process.env.STRICT_SIGNATURE || "false"); // trueで無効署名を403
 const AXIOS_TIMEOUT_MS = Number(process.env.AXIOS_TIMEOUT_MS || 5000);
+// ダブルタップ抑止（同一ユーザー/グループ×同一ペイロードを一定時間だけ1回許可）
+const TAP_DEBOUNCE_MS = Number(process.env.TAP_DEBOUNCE_MS || 1200);
 
 // ====== 生ボディ保持（署名検証用） ======
 function rawBodySaver(req, res, buf, encoding) {
@@ -84,7 +86,7 @@ const faqData = {
     "更衣室": { q: "更衣室はありますか？", a: "館内1階に個室の更衣室があります\n11:45～利用可能です" },
 };
 
-// ====== メッセージ生成 ======
+// ====== メッセージ生成（※ボタンは message アクションのまま。postback対応もサーバ側で用意） ======
 const createFaqListFlex = () => ({
     type: "flex",
     altText: "結婚式FAQリスト",
@@ -189,7 +191,7 @@ async function replyWithRetry(eventId, replyToken, rawMessages) {
             console.log("[LINE Reply]", {
                 eventId, status: resp.status, attempt, elapsed: elapsed(start), size: messages.length,
             });
-            return;
+            return; // 成功したら即終了（replyTokenは1回限り）
         } catch (err) {
             const status = err.response?.status;
             const data = err.response?.data;
@@ -242,6 +244,30 @@ function safeLogEvent(e) {
     console.log("[Webhook Event]", JSON.stringify(base), "at", toISO());
 }
 
+// ====== ダブルタップ抑止（サーバ側デバウンス） ======
+const tapGuards = new Map(); // mapKey -> expireAt
+const TAP_GUARD_SWEEP_MS = 60 * 1000;
+setInterval(() => {
+    const t = Date.now();
+    for (const [k, exp] of tapGuards.entries()) if (exp <= t) tapGuards.delete(k);
+}, TAP_GUARD_SWEEP_MS);
+
+function normalizePayloadText(s) {
+    return String(s || "").trim().toLowerCase();
+}
+
+function tapGuardAccept(userOrGroupKey, payloadText) {
+    const norm = normalizePayloadText(payloadText);
+    const mapKey = `${userOrGroupKey}|${norm}`;
+    const t = Date.now();
+    const exp = tapGuards.get(mapKey);
+    if (exp && exp > t) {
+        return false; // デバウンス期間内は拒否
+    }
+    tapGuards.set(mapKey, t + TAP_DEBOUNCE_MS);
+    return true;
+}
+
 // ====== キュー制御（同期版 per-key ロック） ======
 const perKeyQueue = new Map(); // key -> Promise chain
 
@@ -285,6 +311,7 @@ async function processEvent(event) {
 
     safeLogEvent(event);
 
+    // follow
     if (event.type === "follow" && event.replyToken) {
         await replyWithRetry(eventId, event.replyToken, [
             { type: "text", text: "友だち追加ありがとうございます！\n「faq」「huku」「test」を試してみてください。" },
@@ -292,12 +319,42 @@ async function processEvent(event) {
         return;
     }
 
+    // postback（将来ボタンをpostback化しても動作）
+    if (event.type === "postback" && event.replyToken) {
+        const userKey = keyFromEvent(event);
+        const data = String(event.postback?.data || "");
+        if (!tapGuardAccept(userKey, data)) {
+            console.log("[TapGuard] Ignored duplicate postback", { eventId, userKey, data, windowMs: TAP_DEBOUNCE_MS });
+            return;
+        }
+
+        if (data.startsWith("faq:")) {
+            const key = decodeURIComponent(data.slice(4));
+            const msgs = faqData[key] ? [createFaqAnswerFlex(key)] : [{ type: "text", text: "その質問には対応していません。" }];
+            await replyWithRetry(eventId, event.replyToken, msgs);
+            return;
+        }
+
+        // その他のpostbackコマンドはここに追加
+        return;
+    }
+
+    // text message
     if (event.type === "message" && event.message?.type === "text" && event.replyToken) {
+        const userKey = keyFromEvent(event);
+        // “FAQ:xxx / huku / test / faq” 等をデバウンス
+        if (!tapGuardAccept(userKey, event.message.text)) {
+            console.log("[TapGuard] Ignored duplicate tap within window", {
+                eventId, userKey, text: event.message.text, windowMs: TAP_DEBOUNCE_MS
+            });
+            return;
+        }
         const msgs = routeMessage(event.message.text);
         await replyWithRetry(eventId, event.replyToken, msgs || [{ type: "text", text: "ご質問ありがとうございます。" }]);
         return;
     }
 
+    // 未対応タイプはno-op
     console.log("[Info] Unsupported event type handled as no-op", { eventId, type: event.type });
 }
 
@@ -311,6 +368,8 @@ app.get("/health", (_, res) => {
         uptimeSec: Math.floor(process.uptime()),
         perKeyQueues: perKeyQueue.size,
         seenCacheSize: seen.size,
+        tapGuardSize: tapGuards.size,
+        tapWindowMs: TAP_DEBOUNCE_MS,
     });
 });
 
