@@ -1,21 +1,30 @@
-﻿// app.js - LINE Messaging API webhook（同期処理・ダブルタップ抑止・最終完全版）
+﻿// app.js - LINE Messaging API webhook（同期処理・分散タップ抑止・完全版／祝席向け文面）
+// 機能一覧：
 // - 同期処理：1リクエスト内で逐次処理→完了後に200返却
-// - 同一ユーザー/グループで直列化（リクエストをまたいでも順序保証）
-// - ダブルタップ抑止（サーバ側デバウンス：同一ペイロードを一定時間1回に制限）
+// - 同一ユーザー/グループで直列化（リクエスト跨ぎでも順序保証）
+// - ダブルタップ抑止（デバウンス：同一ペイロード一定時間1回・Redis対応）
+// - 重複配送デデュープ（webhookEventId優先・Redis対応）
 // - 署名検証（STRICT_SIGNATURE=true で無効署名は403）
 // - Keep-Alive（LINE API接続高速化）
-// - 重複配送デデュープ（webhookEventId/Redelivery）
 // - 429/5xx リトライ（指数バックオフ＋Retry-After）
-// - 構造化ログ（相関ID, elapsed ms）
+// - reply 失敗時の Push 代替（ユーザー宛のみ）
+// - 構造化ログ（pino）＋相関ID（x-request-id）
+// - Prometheusメトリクス（/metrics） ヒストグラム/カウンタ
+// - ユーザー単位レート制限（簡易トークンバケット）
+// - ルーター方式コマンド（拡張容易）＋Quick Reply
+// - 管理者ステータスコマンド（admin:stats）
 // - 健康チェック(/health)・疎通(/webhook GET)
-// - 既存応答：faq / FAQ:<key> / huku / test
+// - 祝席向け：フォロー時の挨拶＆未定義コマンド応答を縁起よく配慮
 "use strict";
 
 const express = require("express");
 const axios = require("axios");
-const crypto = require("crypto");
+const { randomUUID, createHmac } = require("crypto");
 const http = require("http");
 const https = require("https");
+const pino = require("pino");
+const Redis = require("ioredis");
+const client = require("prom-client"); // Prometheus
 
 const app = express();
 
@@ -23,10 +32,33 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const TOKEN = process.env.LINE_ACCESS_TOKEN;               // 必須
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;     // 推奨
-const STRICT_SIGNATURE = /^true$/i.test(process.env.STRICT_SIGNATURE || "false"); // trueで無効署名を403
+const STRICT_SIGNATURE = /^true$/i.test(process.env.STRICT_SIGNATURE || "false"); // trueで無効署名403
 const AXIOS_TIMEOUT_MS = Number(process.env.AXIOS_TIMEOUT_MS || 5000);
-// ダブルタップ抑止（同一ユーザー/グループ×同一ペイロードを一定時間だけ1回許可）
+
+// デバウンス（タップガード）とデデュープのTTL
 const TAP_DEBOUNCE_MS = Number(process.env.TAP_DEBOUNCE_MS || 1200);
+const DEDUPE_TTL_MS = Number(process.env.DEDUPE_TTL_MS || 5 * 60 * 1000);
+
+// レート制限（ユーザー単位トークンバケット）
+const RATE_CAP = Number(process.env.RATE_CAP || 10); // バースト上限
+const RATE_REFILL = Number(process.env.RATE_REFILL || 1); // 1秒あたり回復数
+
+// 管理者（admin:stats 実行許可）
+const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
+
+// Redis（任意）: 指定時はタップガード/デデュープを分散実装
+const REDIS_URL = process.env.REDIS_URL || "";
+let redis = null;
+if (REDIS_URL) {
+    redis = new Redis(REDIS_URL);
+}
+
+// ====== ロガー ======
+const logger = pino(
+    process.env.NODE_ENV === "production"
+        ? {}
+        : { transport: { target: "pino-pretty" } }
+);
 
 // ====== 生ボディ保持（署名検証用） ======
 function rawBodySaver(req, res, buf, encoding) {
@@ -35,11 +67,28 @@ function rawBodySaver(req, res, buf, encoding) {
 app.use(express.json({ verify: rawBodySaver }));
 app.use(express.urlencoded({ extended: true, verify: rawBodySaver }));
 
+// ====== 相関ID付与ミドルウェア ======
+app.use((req, res, next) => {
+    const rid = req.get("x-request-id") || randomUUID();
+    req.rid = rid;
+    res.setHeader("x-request-id", rid);
+    const start = Date.now();
+    res.on("finish", () => {
+        logger.info({
+            rid, method: req.method, url: req.originalUrl, status: res.statusCode,
+            elapsedMs: Date.now() - start
+        }, "HTTP finished");
+    });
+    next();
+});
+
 // ====== 起動ログ ======
-console.log(`[BOOT] PORT=${PORT}`);
-if (!TOKEN) console.error("[FATAL] LINE_ACCESS_TOKEN 未設定");
-if (!CHANNEL_SECRET) console.warn("[WARN] LINE_CHANNEL_SECRET 未設定（署名検証スキップ可）");
-if (STRICT_SIGNATURE) console.log("[BOOT] STRICT_SIGNATURE=ON （無効署名は403）");
+logger.info({ PORT }, "[BOOT] starting");
+if (!TOKEN) logger.error("[FATAL] LINE_ACCESS_TOKEN 未設定");
+if (!CHANNEL_SECRET) logger.warn("[WARN] LINE_CHANNEL_SECRET 未設定（署名検証スキップ可）");
+if (STRICT_SIGNATURE) logger.info("[BOOT] STRICT_SIGNATURE=ON （無効署名は403）");
+if (redis) logger.info({ REDIS_URL }, "[BOOT] Redis enabled for dedupe/tapGuard");
+else logger.warn("[BOOT] Redis disabled, will use in-memory for dedupe/tapGuard");
 
 // ====== Keep-Alive Axios（LINE API用） ======
 const keepAliveHttpAgent = new http.Agent({
@@ -64,12 +113,32 @@ const line = axios.create({
     maxBodyLength: 2 * 1024 * 1024,
 });
 
+// ====== Prometheus メトリクス ======
+client.collectDefaultMetrics();
+const webhookHist = new client.Histogram({
+    name: "line_webhook_duration_seconds",
+    help: "Webhook processing time",
+    buckets: [0.1, 0.3, 0.5, 1, 2, 5, 10],
+});
+const replyCounter = new client.Counter({
+    name: "line_reply_messages_total",
+    help: "Total messages replied",
+});
+const rateLimitBlockCounter = new client.Counter({
+    name: "line_ratelimit_block_total",
+    help: "Rate limit blocks",
+});
+const tapGuardBlockCounter = new client.Counter({
+    name: "line_tapguard_block_total",
+    help: "Tap guard (debounce) blocks",
+});
+
 // ====== 計測ユーティリティ ======
 const now = () => Date.now();
 const elapsed = (t) => `${Date.now() - t}ms`;
 const toISO = (d = new Date()) => d.toISOString();
 
-// ====== データ ======
+// ====== データ（サンプル応答） ======
 const rabbitImages = [
     "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564051997_0.jpg",
     "https://raw.githubusercontent.com/rara0423usapiy02-debug/express-hello-world/c19ba036deab7aebd1484d78191d27a8a7060b9c/huku/S__564051999_0.jpg",
@@ -79,14 +148,14 @@ const rabbitImages = [
 ];
 
 const faqData = {
-    "駐車場": { q: "駐車場はありますか？", a: "会場には無料でご利用いただける駐車場がございます(最大78台)\nどうぞ安心してお越しください" },
-    "服装": { q: "服装の指定はありますか？", a: "平服でお越しください\n男性はスーツ、女性はセミフォーマルがおすすめです\n屋外に出る場面もあるため羽織れる服が安心です" },
-    "送迎バス": { q: "送迎バスの時間を変更したい", a: "招待状で回答以外の便にも乗車可能です\nご都合に合わせてご利用ください" },
-    "大宮からタクシー": { q: "大宮駅からタクシー", a: "5～10分程で到着します（交通事情による）\n西口よりご乗車ください" },
-    "更衣室": { q: "更衣室はありますか？", a: "館内1階に個室の更衣室があります\n11:45～利用可能です" },
+    "駐車場": { q: "駐車場はありますか？", a: "会場には無料でご利用いただける駐車場がございます（最大78台）。どうぞ安心してお越しください。" },
+    "服装": { q: "服装の指定はありますか？", a: "平服でお越しください。男性はスーツ、女性はセミフォーマルがおすすめです。屋外に出る場面もございますので羽織れる服が安心です。" },
+    "送迎バス": { q: "送迎バスの時間を変更したい", a: "招待状でご回答以外の便にもご乗車いただけます。ご都合に合わせてご利用ください。" },
+    "大宮からタクシー": { q: "大宮駅からタクシー", a: "5～10分ほどで到着いたします（交通事情により前後します）。西口よりご乗車ください。" },
+    "更衣室": { q: "更衣室はありますか？", a: "館内1階に個室の更衣室がございます。11:45からご利用いただけます。" },
 };
 
-// ====== メッセージ生成（※ボタンは message アクションのまま。postback対応もサーバ側で用意） ======
+// ====== メッセージ生成 ======
 const createFaqListFlex = () => ({
     type: "flex",
     altText: "結婚式FAQリスト",
@@ -113,7 +182,7 @@ const createFaqListFlex = () => ({
 
 const createFaqAnswerFlex = (key) => ({
     type: "flex",
-    altText: faqData[key].q,
+    altText: faqData[key]?.q || "ご案内",
     contents: {
         type: "bubble",
         styles: { body: { backgroundColor: "#FFFAF0" } },
@@ -121,8 +190,8 @@ const createFaqAnswerFlex = (key) => ({
             type: "box",
             layout: "vertical",
             contents: [
-                { type: "text", text: "Q. " + faqData[key].q, weight: "bold", size: "md", color: "#C19A6B" },
-                { type: "text", text: "A. " + faqData[key].a, wrap: true, size: "sm", margin: "md", color: "#333333" },
+                { type: "text", text: "Q. " + (faqData[key]?.q || "ご案内"), weight: "bold", size: "md", color: "#C19A6B" },
+                { type: "text", text: "A. " + (faqData[key]?.a || "ただいまご案内のご用意がありませんでした。"), wrap: true, size: "sm", margin: "md", color: "#333333" },
             ],
         },
     },
@@ -133,27 +202,52 @@ const createRandomRabbitImage = () => {
     return [{ type: "image", originalContentUrl: img, previewImageUrl: img }];
 };
 
-// ====== ルーティング ======
-function routeMessage(msg) {
-    const textRaw = (msg || "");
-    const text = textRaw.trim();
-    const lc = text.toLowerCase();
+// Quick Reply ヘルパ
+function withQuickReply(messages, items = []) {
+    const quickReply = {
+        items: items.map(i => ({ type: "action", action: { type: "message", label: i.label, text: i.text } }))
+    };
+    const compact = sanitizeMessages(messages);
+    if (compact.length === 0) return compact;
+    const [head, ...rest] = compact;
+    return [{ ...head, quickReply }, ...rest];
+}
 
-    if (lc === "faq") return [createFaqListFlex()];
+// ====== ルーター（拡張容易） ======
+const routes = [
+    {
+        match: /^admin:stats$/i,
+        handle: (text, m, event) => {
+            if (event.source?.type === "user" && ADMIN_USER_IDS.includes(event.source.userId)) {
+                const body = [
+                    `uptimeSec: ${Math.floor(process.uptime())}`,
+                    `perKeyQueues: ${perKeyQueue.size}`,
+                    `seenCacheSize: ${seenSize()}`,
+                    `tapGuardSize: ${tapGuardSize()}`,
+                    `rateEntries: ${rate.size}`
+                ].join("\n");
+                return [{ type: "text", text: body }];
+            }
+            return [{ type: "text", text: "権限対象ではございません。" }];
+        }
+    },
+    { match: /^faq$/i, handle: () => [createFaqListFlex()] },
+    {
+        match: /^faq:(.+)$/i,
+        handle: (_, m) => {
+            const key = m[1].trim();
+            return faqData[key] ? [createFaqAnswerFlex(key)] : [{ type: "text", text: "ただいまご案内のご用意がありませんでした。" }];
+        }
+    },
+    { match: /\bhuku\b/i, handle: () => createRandomRabbitImage() },
+    { match: /^test$/i, handle: () => [{ type: "text", text: "Hello, user" }, { type: "text", text: "May I help you?" }] },
+];
 
-    if (lc.startsWith("faq:")) {
-        const key = text.replace(/^faq:/i, "").trim();
-        return faqData[key] ? [createFaqAnswerFlex(key)] : [{ type: "text", text: "その質問には対応していません。" }];
+function routeMessage2(text, event) {
+    for (const r of routes) {
+        const m = text.match(r.match);
+        if (m) return r.handle(text, m, event);
     }
-
-    if (/(\bhuku\b)/i.test(text)) {
-        return createRandomRabbitImage();
-    }
-
-    if (lc === "test") {
-        return [{ type: "text", text: "Hello, user" }, { type: "text", text: "May I help you?" }];
-    }
-
     return null;
 }
 
@@ -162,12 +256,12 @@ function validateSignature(req) {
     if (!CHANNEL_SECRET) return { ok: true, reason: "no-secret" };
     const signature = req.get("x-line-signature");
     if (!signature || !req.rawBody) return { ok: false, reason: "missing" };
-    const digest = crypto.createHmac("sha256", CHANNEL_SECRET).update(req.rawBody).digest("base64");
+    const digest = createHmac("sha256", CHANNEL_SECRET).update(req.rawBody).digest("base64");
     const ok = signature === digest;
     return { ok, reason: ok ? "match" : "mismatch" };
 }
 
-// ====== 返信（リトライ付） ======
+// ====== 返信（リトライ付）＋Pushフォールバック ======
 const MAX_REPLY_MESSAGES = 5;
 
 function sanitizeMessages(messages) {
@@ -180,7 +274,7 @@ async function replyWithRetry(eventId, replyToken, rawMessages) {
     const start = now();
     const messages = sanitizeMessages(rawMessages);
     if (messages.length === 0) {
-        console.warn("[Reply Skip]", { eventId, reason: "no-messages" });
+        logger.warn({ eventId }, "[Reply Skip] no-messages");
         return;
     }
 
@@ -188,34 +282,52 @@ async function replyWithRetry(eventId, replyToken, rawMessages) {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
             const resp = await line.post("/v2/bot/message/reply", { replyToken, messages });
-            console.log("[LINE Reply]", {
-                eventId, status: resp.status, attempt, elapsed: elapsed(start), size: messages.length,
-            });
-            return; // 成功したら即終了（replyTokenは1回限り）
+            replyCounter.inc(messages.length);
+            logger.info({ eventId, status: resp.status, attempt, elapsed: elapsed(start), size: messages.length }, "LINE Reply OK");
+            return; // 成功したら終了
         } catch (err) {
             const status = err.response?.status;
             const data = err.response?.data;
             const retryAfterSec = parseInt(err.response?.headers?.["retry-after"] || "0", 10);
-            console.error("[LINE API error]", {
-                eventId, attempt, status, data, elapsed: elapsed(start),
-            });
+            logger.error({ eventId, attempt, status, data, elapsed: elapsed(start) }, "LINE Reply error");
 
             if (status === 429 || (status >= 500 && status < 600)) {
                 const backoff = retryAfterSec > 0 ? retryAfterSec * 1000 : Math.min(2000 * Math.pow(2, attempt - 1), 8000);
                 await new Promise(r => setTimeout(r, backoff));
                 continue;
             }
-            return; // 4xx（失効等）は即断念
+            throw err; // 4xxは上に投げる（フォールバック判断用）
+        }
+    }
+}
+
+async function pushMessage(to, rawMessages) {
+    const messages = sanitizeMessages(rawMessages);
+    await line.post("/v2/bot/message/push", { to, messages });
+    replyCounter.inc(messages.length);
+}
+
+async function replyWithRetryOrPush(event, rawMessages) {
+    const eventId = event.webhookEventId || "no-id";
+    try {
+        await replyWithRetry(eventId, event.replyToken, rawMessages);
+    } catch (e) {
+        const status = e.response?.status;
+        if ((status >= 400 && status < 500) && event.source?.type === "user" && event.source.userId) {
+            logger.warn({ eventId, status }, "Reply failed -> Push fallback");
+            await pushMessage(event.source.userId, rawMessages);
+        } else {
+            throw e;
         }
     }
 }
 
 // ====== デデュープ（再配送/重複ID） ======
-const seen = new Map(); // id -> expireAt
-const SEEN_TTL = 5 * 60 * 1000; // 5分
+const seenMem = new Map(); // id -> expireAt（メモリ用）
 setInterval(() => {
+    if (redis) return;
     const t = now();
-    for (const [k, v] of seen.entries()) if (v <= t) seen.delete(k);
+    for (const [k, v] of seenMem.entries()) if (v <= t) seenMem.delete(k);
 }, 60 * 1000);
 
 function eventKey(e) {
@@ -223,48 +335,85 @@ function eventKey(e) {
     return `${e.type}:${e.message?.id || ""}:${e.timestamp || ""}`;
 }
 
-function isDuplicate(event) {
+async function isDuplicate(event) {
     const key = eventKey(event);
     const t = now();
-    const exp = seen.get(key);
-    if (exp && exp > t) return true;
-    seen.set(key, t + SEEN_TTL);
-    return false;
+    if (redis) {
+        // SET PX TTL NX -> if OK, first seen; else duplicate
+        const ok = await redis.set(`dedupe:${key}`, "1", "PX", DEDUPE_TTL_MS, "NX");
+        return ok !== "OK";
+    } else {
+        const exp = seenMem.get(key);
+        if (exp && exp > t) return true;
+        seenMem.set(key, t + DEDUPE_TTL_MS);
+        return false;
+    }
+}
+function seenSize() {
+    return redis ? -1 : seenMem.size; // Redis時は不明のため -1
 }
 
 // ====== ログ整形 ======
-function safeLogEvent(e) {
+function safeLogEvent(e, rid) {
     const base = {
+        rid,
         eventId: e.webhookEventId || null,
         type: e.type,
         source: e.source?.type,
         msgType: e.message?.type,
         text: e.message?.text,
     };
-    console.log("[Webhook Event]", JSON.stringify(base), "at", toISO());
+    logger.info(base, "[Webhook Event]");
 }
 
-// ====== ダブルタップ抑止（サーバ側デバウンス） ======
-const tapGuards = new Map(); // mapKey -> expireAt
-const TAP_GUARD_SWEEP_MS = 60 * 1000;
+// ====== ダブルタップ抑止（タップガード：Redis or メモリ） ======
+const tapMem = new Map(); // mapKey -> expireAt（メモリ用）
 setInterval(() => {
+    if (redis) return;
     const t = Date.now();
-    for (const [k, exp] of tapGuards.entries()) if (exp <= t) tapGuards.delete(k);
-}, TAP_GUARD_SWEEP_MS);
+    for (const [k, exp] of tapMem.entries()) if (exp <= t) tapMem.delete(k);
+}, 60 * 1000);
 
 function normalizePayloadText(s) {
     return String(s || "").trim().toLowerCase();
 }
 
-function tapGuardAccept(userOrGroupKey, payloadText) {
+async function tapGuardAccept(userOrGroupKey, payloadText) {
     const norm = normalizePayloadText(payloadText);
     const mapKey = `${userOrGroupKey}|${norm}`;
-    const t = Date.now();
-    const exp = tapGuards.get(mapKey);
-    if (exp && exp > t) {
-        return false; // デバウンス期間内は拒否
+    if (redis) {
+        const ok = await redis.set(`tap:${mapKey}`, "1", "PX", TAP_DEBOUNCE_MS, "NX");
+        const accept = ok === "OK";
+        if (!accept) tapGuardBlockCounter.inc();
+        return accept;
+    } else {
+        const t = Date.now();
+        const exp = tapMem.get(mapKey);
+        if (exp && exp > t) {
+            tapGuardBlockCounter.inc();
+            return false;
+        }
+        tapMem.set(mapKey, t + TAP_DEBOUNCE_MS);
+        return true;
     }
-    tapGuards.set(mapKey, t + TAP_DEBOUNCE_MS);
+}
+function tapGuardSize() {
+    return redis ? -1 : tapMem.size;
+}
+
+// ====== レート制限（ユーザー単位 簡易トークンバケット） ======
+const rate = new Map(); // key -> { tokens, updatedAtSec }
+function allowRate(key) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const cur = rate.get(key) || { tokens: RATE_CAP, updatedAt: nowSec };
+    const refill = (nowSec - cur.updatedAt) * RATE_REFILL;
+    const tokens = Math.min(RATE_CAP, cur.tokens + refill);
+    if (tokens < 1) {
+        rate.set(key, { tokens, updatedAt: nowSec });
+        rateLimitBlockCounter.inc();
+        return false;
+    }
+    rate.set(key, { tokens: tokens - 1, updatedAt: nowSec });
     return true;
 }
 
@@ -297,68 +446,81 @@ function lockPerKeyAndRun(key, taskFn) {
 }
 
 // ====== イベント処理 ======
-async function processEvent(event) {
+async function processEvent(event, rid) {
     const eventId = event.webhookEventId || "no-id";
 
     if (event?.deliveryContext?.isRedelivery) {
-        console.log("[Skip] Redelivery", { eventId });
+        logger.info({ rid, eventId }, "[Skip] Redelivery");
         return;
     }
-    if (isDuplicate(event)) {
-        console.log("[Skip] Duplicate", { eventId });
+    if (await isDuplicate(event)) {
+        logger.info({ rid, eventId }, "[Skip] Duplicate");
         return;
     }
 
-    safeLogEvent(event);
+    // レート制限（ユーザー/グループ単位）
+    const userKey = keyFromEvent(event);
+    if (!allowRate(userKey)) {
+        logger.warn({ rid, eventId, userKey }, "[RateLimit] Too many requests");
+        return;
+    }
 
-    // follow
+    safeLogEvent(event, rid);
+
+    // follow（祝席向け文面）
     if (event.type === "follow" && event.replyToken) {
-        await replyWithRetry(eventId, event.replyToken, [
-            { type: "text", text: "友だち追加ありがとうございます！\n「faq」「huku」「test」を試してみてください。" },
+        await replyWithRetryOrPush(event, [
+            { type: "text", text: "追加ありがとうございます。\nこのトークルームは、当日も利用しますのでよろしくお願いいたします！" }
         ]);
         return;
     }
 
-    // postback（将来ボタンをpostback化しても動作）
+    // postback（ボタンpostback化を想定）
     if (event.type === "postback" && event.replyToken) {
-        const userKey = keyFromEvent(event);
         const data = String(event.postback?.data || "");
-        if (!tapGuardAccept(userKey, data)) {
-            console.log("[TapGuard] Ignored duplicate postback", { eventId, userKey, data, windowMs: TAP_DEBOUNCE_MS });
+        if (!(await tapGuardAccept(userKey, data))) {
+            logger.info({ rid, eventId, userKey, data, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate postback");
             return;
         }
 
         if (data.startsWith("faq:")) {
             const key = decodeURIComponent(data.slice(4));
-            const msgs = faqData[key] ? [createFaqAnswerFlex(key)] : [{ type: "text", text: "その質問には対応していません。" }];
-            await replyWithRetry(eventId, event.replyToken, msgs);
+            const msgs = faqData[key] ? [createFaqAnswerFlex(key)] : [{ type: "text", text: "ただいまご案内のご用意がありませんでした。" }];
+            await replyWithRetryOrPush(event, msgs);
             return;
         }
 
-        // その他のpostbackコマンドはここに追加
+        // その他のpostbackコマンド
+        await replyWithRetryOrPush(event, [
+            { type: "text", text: "ただいまご案内のご用意がありませんでした。" }
+        ]);
         return;
     }
 
     // text message
     if (event.type === "message" && event.message?.type === "text" && event.replyToken) {
-        const userKey = keyFromEvent(event);
-        // “FAQ:xxx / huku / test / faq” 等をデバウンス
-        if (!tapGuardAccept(userKey, event.message.text)) {
-            console.log("[TapGuard] Ignored duplicate tap within window", {
-                eventId, userKey, text: event.message.text, windowMs: TAP_DEBOUNCE_MS
-            });
+        if (!(await tapGuardAccept(userKey, event.message.text))) {
+            logger.info({ rid, eventId, userKey, text: event.message.text, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate tap");
             return;
         }
-        const msgs = routeMessage(event.message.text);
-        await replyWithRetry(eventId, event.replyToken, msgs || [{ type: "text", text: "ご質問ありがとうございます。" }]);
+
+        const msgs = routeMessage2(event.message.text.trim(), event);
+        if (msgs) {
+            await replyWithRetryOrPush(event, msgs);
+        } else {
+            await replyWithRetryOrPush(event, withQuickReply(
+                [{ type: "text", text: "ご質問ありがとうございます。メニューからもお選びいただけます。" }],
+                [{ label: "FAQ", text: "faq" }, { label: "写真", text: "huku" }, { label: "テスト", text: "test" }]
+            ));
+        }
         return;
     }
 
-    // 未対応タイプはno-op
-    console.log("[Info] Unsupported event type handled as no-op", { eventId, type: event.type });
+    // 未対応タイプはno-op（ユーザーには出さない）
+    logger.info({ rid, eventId, type: event.type }, "[Info] Unsupported event type -> no-op");
 }
 
-// ====== 健康チェック/疎通 ======
+// ====== 健康チェック/疎通/メトリクス ======
 app.get("/", (_, res) => res.status(200).send("OK"));
 app.get("/webhook", (_, res) => res.status(200).send("webhook ok"));
 app.get("/health", (_, res) => {
@@ -367,54 +529,65 @@ app.get("/health", (_, res) => {
         ts: toISO(),
         uptimeSec: Math.floor(process.uptime()),
         perKeyQueues: perKeyQueue.size,
-        seenCacheSize: seen.size,
-        tapGuardSize: tapGuards.size,
+        seenCacheSize: seenSize(),
+        tapGuardSize: tapGuardSize(),
         tapWindowMs: TAP_DEBOUNCE_MS,
+        rateEntries: rate.size,
+        redis: !!redis,
     });
+});
+app.get("/metrics", async (_, res) => {
+    res.set("Content-Type", client.register.contentType);
+    res.end(await client.register.metrics());
 });
 
 // ====== Webhook（同期処理：全処理完了後に200） ======
 app.post("/webhook", async (req, res) => {
+    const rid = req.rid;
     const sig = validateSignature(req);
     if (!sig.ok) {
-        console.warn("[WARN] Invalid signature", sig);
+        logger.warn({ rid, sig }, "[WARN] Invalid signature");
         if (STRICT_SIGNATURE) return res.sendStatus(403);
         return res.sendStatus(200); // デバッグ運用：受領した体で終了
     }
 
+    const endTimer = webhookHist.startTimer();
     const start = now();
     try {
         const events = Array.isArray(req.body?.events) ? req.body.events : [];
         if (events.length === 0) {
-            console.log("[Webhook] No events");
+            logger.info({ rid }, "[Webhook] No events");
+            endTimer();
             return res.sendStatus(200);
         }
 
-        // 同期で逐次処理（ここでawait）
+        // 同期で逐次処理（per-keyロックで他リクエストとも直列合流）
         for (const ev of events) {
             const key = keyFromEvent(ev);
-            await lockPerKeyAndRun(key, async () => processEvent(ev));
+            await lockPerKeyAndRun(key, async () => processEvent(ev, rid));
         }
 
+        endTimer();
         return res.sendStatus(200);
     } catch (e) {
-        console.error("[Webhook Handling Error]", e?.stack || e);
-        // 運用方針に応じて500/200を選択（ここでは500で再送誘発）
+        logger.error({ rid, err: e.stack || e }, "[Webhook Handling Error]");
+        endTimer();
+        // 再送誘発したい場合は500
         return res.sendStatus(500);
     } finally {
-        console.log("[Webhook Sync Done]", { elapsed: elapsed(start) });
+        logger.info({ rid, elapsed: elapsed(start) }, "[Webhook Sync Done]");
     }
 });
 
 // ====== 起動/終了 ======
 const server = app.listen(PORT, () => {
-    console.log(`Server running at http://localhost:${PORT}`);
+    logger.info(`Server running at http://localhost:${PORT}`);
 });
 
 function shutdown(code = 0) {
-    console.log("[Shutdown] closing server...");
+    logger.info("[Shutdown] closing server...");
     server.close(() => {
-        console.log("[Shutdown] closed. Bye.");
+        logger.info("[Shutdown] closed. Bye.");
         process.exit(code);
     });
     setTimeout(() => process.exit(code), 5000).unref();
