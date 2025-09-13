@@ -509,8 +509,7 @@ async function processEvent(event, rid) {
             await replyWithRetryOrPush(event, msgs);
         } else {
             await replyWithRetryOrPush(event, withQuickReply(
-                [{ type: "text", text: "ご質問ありがとうございます。メニューからもお選びいただけます。" }],
-                [{ label: "FAQ", text: "faq" }, { label: "写真", text: "huku" }, { label: "テスト", text: "test" }]
+                [{ type: "text", text: "ご質問ありがとうございます\nこちらのチャットでは自動返信に対応していません\nメニューから選択をお願いします" }]
             ));
         }
         return;
