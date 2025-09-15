@@ -1,17 +1,18 @@
 ﻿// app.refactored.js - LINE Messaging API webhook（同期処理・分散タップ抑止・管理者自己登録対応／祝席向け文面・観測性強化）
-// 変更点サマリはチャット側で説明。既存 app.js と差し替え可能な単一ファイル構成。
+// 既存 app.js と差し替え可能な単一ファイル構成。
 "use strict";
 
 /**
- * ■ 本ファイルの主な改善点（詳細はチャットのステップで説明）
- * - reply/push 双方に指数バックオフリトライを実装（Push も安定化）
- * - Quick Reply が空のとき 400 を回避する二重防御（送信直前も除去）
- * - Redis イベント監視・終了時の安全なクローズ
+ * ■ 本ファイルの主な改善点
+ * - reply/push 双方に指数バックオフリトライ（429/5xx + Retry-After）
+ * - Quick Reply の空配列送信を二重防御で抑止
+ * - Redis 監視・安全終了
  * - /metrics に簡易 Basic 認証（任意）
- * - 署名検証の強化（欠落や改ざん時のログ粒度向上）
- * - ログの構造化強化（エラー時ヘッダ/応答本文の要約）
- * - 健康チェックの拡充（メモリ使用量・Redis状態）
- * - いくつかの視認性/保守性リファクタ（関数分割・命名・コメント）
+ * - 署名検証の強化（詳細な失敗理由）
+ * - 構造化ログ（相関ID、レスポンス要約）
+ * - 健康チェック拡充（メモリ/Redis/内部キュー）
+ * - ★ follow既定メッセージを削除
+ * - ★ 非コマンド入力の既定メッセージを削除（沈黙）
  */
 
 const express = require("express");
@@ -48,36 +49,24 @@ const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || "").split(",").map(s => s.
 // 管理者 自己登録の合言葉（設定時のみ有効）
 const ADMIN_REG_TOKEN = process.env.ADMIN_REG_TOKEN || "";
 
-// Redis（任意）：指定時はデデュープ/タップガード/管理者セットを分散共有
+// Redis（任意）
 const REDIS_URL = process.env.REDIS_URL || "";
 let redis = null;
-if (REDIS_URL) {
-    redis = new Redis(REDIS_URL, {
-        lazyConnect: false,
-        enableAutoPipelining: true,
-        maxRetriesPerRequest: 3,
-    });
-    redis.on("error", (err) => logger.error({ err: String(err) }, "[Redis] error"));
-    redis.on("connect", () => logger.info({ REDIS_URL }, "[Redis] connected"));
-    redis.on("close", () => logger.warn("[Redis] connection closed"));
-}
 
 // ====== ロガー ======
 let logger;
 try {
     logger = pino(process.env.NODE_ENV === "production" ? {} : { transport: { target: "pino-pretty" } });
 } catch {
-    // pino-pretty が無くても起動
     logger = pino();
 }
 
 // ====== 起動前チェック ======
 if (!TOKEN) {
-    // 起動だけ確認したい運用もあるため致命ではないが、明示ログを出す
     logger.error("[FATAL] LINE_ACCESS_TOKEN が未設定です。返信/Push は必ず失敗します。");
 }
 if (!CHANNEL_SECRET) {
-    logger.warn("[WARN] LINE_CHANNEL_SECRET 未設定（署名検証をスキップ可能）。STRICT_SIGNATURE=true の場合は 403 返却。");
+    logger.warn("[WARN] LINE_CHANNEL_SECRET 未設定。STRICT_SIGNATURE=true の場合は 403 返却。");
 }
 
 // ====== アプリ初期化 ======
@@ -90,7 +79,7 @@ function rawBodySaver(req, _res, buf, encoding) {
 app.use(express.json({ verify: rawBodySaver }));
 app.use(express.urlencoded({ extended: true, verify: rawBodySaver }));
 
-// ====== 相関ID付与ミドルウェア ======
+// ====== 相関ID付与 ======
 app.use((req, res, next) => {
     const rid = req.get("x-request-id") || randomUUID();
     req.rid = rid;
@@ -103,8 +92,17 @@ app.use((req, res, next) => {
 });
 
 logger.info({ PORT }, "[BOOT] starting");
-if (redis) logger.info({ REDIS_URL }, "[BOOT] Redis enabled for dedupe/tapGuard/admins");
-else logger.warn("[BOOT] Redis disabled, fallback to in-memory store");
+
+// ====== Redis 初期化（ログは logger 以降で） ======
+if (REDIS_URL) {
+    redis = new Redis(REDIS_URL, { lazyConnect: false, enableAutoPipelining: true, maxRetriesPerRequest: 3 });
+    redis.on("error", (err) => logger.error({ err: String(err) }, "[Redis] error"));
+    redis.on("connect", () => logger.info({ REDIS_URL }, "[Redis] connected"));
+    redis.on("close", () => logger.warn("[Redis] connection closed"));
+    logger.info({ REDIS_URL }, "[BOOT] Redis enabled for dedupe/tapGuard/admins");
+} else {
+    logger.warn("[BOOT] Redis disabled, fallback to in-memory store");
+}
 
 // ====== Keep-Alive Axios（LINE API用） ======
 const keepAliveHttpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 10_000, maxSockets: 100, maxFreeSockets: 20 });
@@ -131,6 +129,11 @@ const tapGuardBlockCounter = new prom.Counter({ name: "line_tapguard_block_total
 const now = () => Date.now();
 const elapsed = (t) => `${Date.now() - t}ms`;
 const toISO = (d = new Date()) => d.toISOString();
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function summarizeData(data) {
+    try { return JSON.stringify(data).slice(0, 300); } catch { return String(data).slice(0, 300); }
+}
 
 // ====== データ（サンプル応答） ======
 const rabbitImages = [
@@ -197,10 +200,17 @@ const createRandomRabbitImage = () => {
 };
 
 // ====== Quick Reply ヘルパ（空なら付けない） ======
+function sanitizeMessages(messages) {
+    if (!Array.isArray(messages)) return [];
+    const compact = messages.filter(Boolean);
+    const MAX_REPLY_MESSAGES = 5;
+    return compact.slice(0, MAX_REPLY_MESSAGES);
+}
+
 function withQuickReply(messages, items = []) {
     const compact = sanitizeMessages(messages);
     if (compact.length === 0) return compact;
-    if (!Array.isArray(items) || items.length === 0) return compact; // ★空は付けない（400対策）
+    if (!Array.isArray(items) || items.length === 0) return compact; // ★空は付けない
     const qItems = items
         .filter(i => i && i.label && i.text)
         .map(i => ({ type: "action", action: { type: "message", label: i.label, text: i.text } }));
@@ -220,8 +230,8 @@ function stripEmptyQuickReply(messages) {
     });
 }
 
-// ====== 管理者（自己登録）ユーティリティ ======
-const adminsMem = new Set(); // Redis未使用時の動的管理者
+// ====== 管理者（自己登録） ======
+const adminsMem = new Set();
 async function isAdmin(userId) {
     if (!userId) return false;
     if (ADMIN_USER_IDS.includes(userId)) return true;
@@ -229,9 +239,9 @@ async function isAdmin(userId) {
     return adminsMem.has(userId);
 }
 
-// ====== ルーター（拡張容易） ======
+// ====== ルーター ======
 const routes = [
-    // 管理者：自己登録（コロン/空白どちらでもOK）
+    // 管理者：自己登録
     {
         match: /^admin[:\s]+register\s+(\S+)$/i,
         handle: async (_text, m, event) => {
@@ -254,7 +264,7 @@ const routes = [
             return [{ type: "text", text: "管理者登録を解除いたしました。引き続きよろしくお願いいたします。" }];
         }
     },
-    // 管理者：ステータス（stats / status 両対応・コロン/空白OK）
+    // 管理者：ステータス
     {
         match: /^admin[:\s]+(stats|status)$/i,
         handle: async (_text, _m, event) => {
@@ -278,7 +288,7 @@ const routes = [
     },
     // 一般機能
     { match: /^faq$/i, handle: async () => [createFaqListFlex()] },
-    { match: /^faq:(.+)$/i, handle: async (_t, m) => { const key = m[1].trim(); return faqData[key] ? [createFaqAnswerFlex(key)] : [{ type: "text", text: "ただいまご案内のご用意がありませんでした。" }]; } },
+    { match: /^faq:(.+)$/i, handle: async (_t, m) => { const key = m[1].trim(); return faqData[key] ? [createFaqAnswerFlex(key)] : null; } },
     { match: /\bhuku\b/i, handle: async () => createRandomRabbitImage() },
     { match: /^test$/i, handle: async () => [{ type: "text", text: "Hello, user" }, { type: "text", text: "May I help you?" }] },
 ];
@@ -288,7 +298,7 @@ async function routeMessage(text, event) {
         const m = text.match(r.match);
         if (m) return await r.handle(text, m, event);
     }
-    return null;
+    return null; // ★ヒットしなければ沈黙
 }
 
 // ====== 署名検証 ======
@@ -297,7 +307,6 @@ function validateSignature(req) {
     const signature = req.get("x-line-signature");
     if (!signature || !req.rawBody) return { ok: false, reason: "missing" };
     const digest = createHmac("sha256", CHANNEL_SECRET).update(req.rawBody).digest("base64");
-    // timingSafeEqual で比較（長さ違いは即 false）
     const sigBuf = Buffer.from(signature);
     const digBuf = Buffer.from(digest);
     if (sigBuf.length !== digBuf.length) return { ok: false, reason: "length-mismatch" };
@@ -306,14 +315,6 @@ function validateSignature(req) {
 }
 
 // ====== 返信/Push（リトライ付） ======
-const MAX_REPLY_MESSAGES = 5;
-
-function sanitizeMessages(messages) {
-    if (!Array.isArray(messages)) return [];
-    const compact = messages.filter(Boolean);
-    return compact.slice(0, MAX_REPLY_MESSAGES);
-}
-
 async function replyWithRetry(eventId, replyToken, rawMessages) {
     const start = now();
     const messages = stripEmptyQuickReply(sanitizeMessages(rawMessages));
@@ -384,13 +385,8 @@ async function replyWithRetryOrPush(event, rawMessages) {
     }
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function summarizeData(data) {
-    try { return JSON.stringify(data).slice(0, 300); } catch { return String(data).slice(0, 300); }
-}
-
 // ====== デデュープ（再配送/重複ID） ======
-const seenMem = new Map(); // id -> expireAt（メモリ用）
+const seenMem = new Map(); // id -> expireAt
 setInterval(() => {
     if (redis) return;
     const t = now();
@@ -405,7 +401,6 @@ function eventKey(e) {
 async function isDuplicate(event) {
     const key = eventKey(event);
     if (redis) {
-        // SET PX TTL NX -> if OK, first seen; else duplicate
         const ok = await redis.set(`dedupe:${key}`, "1", "PX", DEDUPE_TTL_MS, "NX");
         return ok !== "OK";
     } else {
@@ -426,8 +421,8 @@ function safeLogEvent(e, rid) {
     logger.info(base, "[Webhook Event]");
 }
 
-// ====== ダブルタップ抑止（タップガード：Redis or メモリ） ======
-const tapMem = new Map(); // mapKey -> expireAt（メモリ用）
+// ====== ダブルタップ抑止（タップガード） ======
+const tapMem = new Map(); // mapKey -> expireAt
 setInterval(() => {
     if (redis) return;
     const t = Date.now();
@@ -471,18 +466,12 @@ function allowRate(key) {
 
 // ====== キュー制御（同期版 per-key ロック） ======
 const perKeyQueue = new Map(); // key -> Promise chain
-
 function keyFromEvent(e) {
     if (e.source?.type === "user") return `user:${e.source.userId || "unknown"}`;
     if (e.source?.type === "group") return `group:${e.source.groupId || "unknown"}`;
     if (e.source?.type === "room") return `room:${e.source.roomId || "unknown"}`;
     return "unknown";
 }
-
-/**
- * 同期版：同じ key の処理を直列化し、caller にも待ってもらう
- * 戻り値: 現在の処理が完了する Promise
- */
 function lockPerKeyAndRun(key, taskFn) {
     const prev = perKeyQueue.get(key) || Promise.resolve();
     const run = prev
@@ -506,7 +495,6 @@ async function processEvent(event, rid) {
         return;
     }
 
-    // レート制限（ユーザー/グループ単位）
     const userKey = keyFromEvent(event);
     if (!allowRate(userKey)) {
         logger.warn({ rid, eventId, userKey }, "[RateLimit] Too many requests");
@@ -515,49 +503,40 @@ async function processEvent(event, rid) {
 
     safeLogEvent(event, rid);
 
-    //// follow（祝席向け文面）
-    //if (event.type === "follow" && event.replyToken) {
-    //    await replyWithRetryOrPush(event, [
-    //        { type: "text", text: "追加ありがとうございます。\nこのトークルームは、当日も利用しますのでよろしくお願いいたします！" }
-    //    ]);
-    //    return;
-    //}
+    // ★ follow は無返信（既定メッセージなし）
+    if (event.type === "follow") {
+        logger.info({ rid, eventId }, "[Info] follow event -> no-op");
+        return;
+    }
 
-    //// postback
-    //if (event.type === "postback" && event.replyToken) {
-    //    const data = String(event.postback?.data || "");
-    //    if (!(await tapGuardAccept(userKey, data))) {
-    //        logger.info({ rid, eventId, userKey, data, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate postback");
-    //        return;
-    //    }
-    //    if (data.startsWith("faq:")) {
-    //        const key = decodeURIComponent(data.slice(4));
-    //        const msgs = faqData[key] ? [createFaqAnswerFlex(key)] : [{ type: "text", text: "ただいまご案内のご用意がありませんでした。" }];
-    //        await replyWithRetryOrPush(event, msgs);
-    //        return;
-    //    }
-    //    await replyWithRetryOrPush(event, [{ type: "text", text: "ただいまご案内のご用意がありませんでした。" }]);
-    //    return;
-    //}
+    // ★ postback：必要になったらここに個別ルーティングを追加。未定義は沈黙
+    if (event.type === "postback") {
+        const data = String(event.postback?.data || "");
+        if (!(await tapGuardAccept(userKey, data))) {
+            logger.info({ rid, eventId, userKey, data, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate postback");
+            return;
+        }
+        // 例: faq:KEY のみ対応する場合
+        if (data.startsWith("faq:")) {
+            const key = decodeURIComponent(data.slice(4));
+            const msgs = faqData[key] ? [createFaqAnswerFlex(key)] : null;
+            if (msgs) await replyWithRetryOrPush(event, msgs);
+        }
+        return; // ヒットしなければ沈黙
+    }
 
-    //// text message
-    //if (event.type === "message" && event.message?.type === "text" && event.replyToken) {
-    //    if (!(await tapGuardAccept(userKey, event.message.text))) {
-    //        logger.info({ rid, eventId, userKey, text: event.message.text, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate tap");
-    //        return;
-    //    }
-    //    const msgs = await routeMessage(event.message.text.trim(), event);
-    //    if (msgs)
-    //    {
-    //        await replyWithRetryOrPush(event, msgs);
-    //    }
-    //    //} else {
-    //    //    await replyWithRetryOrPush(event, withQuickReply(
-    //    //        [{ type: "text", text: "ご質問ありがとうございます。メニューからもお選びいただけます。" }]
-    //    //    ));
-    //    //}
-    //    return;
-    //}
+    // ★ text message：コマンドにヒットしたときのみ返信。非コマンドは沈黙。
+    if (event.type === "message" && event.message?.type === "text" && event.replyToken) {
+        if (!(await tapGuardAccept(userKey, event.message.text))) {
+            logger.info({ rid, eventId, userKey, text: event.message.text, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate tap");
+            return;
+        }
+        const msgs = await routeMessage(event.message.text.trim(), event);
+        if (msgs && msgs.length > 0) {
+            await replyWithRetryOrPush(event, msgs);
+        }
+        return; // マッチしなければ沈黙
+    }
 
     // 未対応タイプは no-op
     logger.info({ rid, eventId, type: event.type }, "[Info] Unsupported event type -> no-op");
@@ -604,7 +583,6 @@ app.post("/webhook", async (req, res) => {
     if (!sig.ok) {
         logger.warn({ rid, sig }, "[WARN] Invalid signature");
         if (STRICT_SIGNATURE) return res.sendStatus(403);
-        // デバッグ運用：受領した体で終了
         return res.sendStatus(200);
     }
 
@@ -618,7 +596,7 @@ app.post("/webhook", async (req, res) => {
             return res.sendStatus(200);
         }
 
-        // 同期で逐次処理（per-keyロックで他リクエストとも直列合流）
+        // 同期で逐次処理（per-keyロック）
         for (const ev of events) {
             const key = keyFromEvent(ev);
             await lockPerKeyAndRun(key, async () => processEvent(ev, rid));
@@ -629,7 +607,6 @@ app.post("/webhook", async (req, res) => {
     } catch (e) {
         logger.error({ rid, err: e.stack || String(e) }, "[Webhook Handling Error]");
         endTimer();
-        // 再送誘発したい場合は 500
         return res.sendStatus(500);
     } finally {
         logger.info({ rid, elapsed: elapsed(start) }, "[Webhook Sync Done]");
