@@ -142,11 +142,11 @@ const rabbitImages = [
 ];
 
 const faqData = {
-    "駐車場": { q: "駐車場はありますか？", a: "会場には無料でご利用いただける駐車場がございます（最大78台）。どうぞ安心してお越しください。" },
-    "服装": { q: "服装の指定はありますか？", a: "平服でお越しください。男性はスーツ、女性はセミフォーマルがおすすめです。屋外に出る場面もございますので羽織れる服が安心です。" },
-    "送迎バス": { q: "送迎バスの時間を変更したい", a: "招待状でご回答以外の便にもご乗車いただけます。ご都合に合わせてご利用ください。" },
-    "大宮からタクシー": { q: "大宮駅からタクシー", a: "5～10分ほどで到着いたします（交通事情により前後します）。西口よりご乗車ください。" },
-    "更衣室": { q: "更衣室はありますか？", a: "館内1階に個室の更衣室がございます。11:45からご利用いただけます。" },
+    "駐車場": { q: "駐車場はありますか？", a: "会場には無料でご利用いただける駐車場がございます!（最大78台）\nどうぞ安心してお越しください!" },
+    "服装": { q: "服装の指定はありますか？", a: "平服でお越しください!\n男性はスーツ、女性はセミフォーマルがおすすめです!!\n屋外に出る場面もございますので羽織れる服が安心です" },
+    "送迎バス": { q: "送迎バスの時間を変更したい", a: "招待状でご回答以外の便にもご乗車いただけます!\nご都合に合わせてご利用ください" },
+    "最終集合時間": { q: "何時までに到着すればよいですか？", a: "13:15分です!\n11:45からウェルカムドリンクを提供しますので是非ご利用ください!" },
+    "更衣室": { q: "更衣室はありますか？", a: "館内1階に個室の更衣室がございます!\n11:45からご利用いただけます!!!" },
 };
 
 // ====== メッセージ生成 ======
@@ -515,47 +515,49 @@ async function processEvent(event, rid) {
 
     safeLogEvent(event, rid);
 
-    // follow（祝席向け文面）
-    if (event.type === "follow" && event.replyToken) {
-        await replyWithRetryOrPush(event, [
-            { type: "text", text: "追加ありがとうございます。\nこのトークルームは、当日も利用しますのでよろしくお願いいたします！" }
-        ]);
-        return;
-    }
+    //// follow（祝席向け文面）
+    //if (event.type === "follow" && event.replyToken) {
+    //    await replyWithRetryOrPush(event, [
+    //        { type: "text", text: "追加ありがとうございます。\nこのトークルームは、当日も利用しますのでよろしくお願いいたします！" }
+    //    ]);
+    //    return;
+    //}
 
-    // postback
-    if (event.type === "postback" && event.replyToken) {
-        const data = String(event.postback?.data || "");
-        if (!(await tapGuardAccept(userKey, data))) {
-            logger.info({ rid, eventId, userKey, data, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate postback");
-            return;
-        }
-        if (data.startsWith("faq:")) {
-            const key = decodeURIComponent(data.slice(4));
-            const msgs = faqData[key] ? [createFaqAnswerFlex(key)] : [{ type: "text", text: "ただいまご案内のご用意がありませんでした。" }];
-            await replyWithRetryOrPush(event, msgs);
-            return;
-        }
-        await replyWithRetryOrPush(event, [{ type: "text", text: "ただいまご案内のご用意がありませんでした。" }]);
-        return;
-    }
+    //// postback
+    //if (event.type === "postback" && event.replyToken) {
+    //    const data = String(event.postback?.data || "");
+    //    if (!(await tapGuardAccept(userKey, data))) {
+    //        logger.info({ rid, eventId, userKey, data, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate postback");
+    //        return;
+    //    }
+    //    if (data.startsWith("faq:")) {
+    //        const key = decodeURIComponent(data.slice(4));
+    //        const msgs = faqData[key] ? [createFaqAnswerFlex(key)] : [{ type: "text", text: "ただいまご案内のご用意がありませんでした。" }];
+    //        await replyWithRetryOrPush(event, msgs);
+    //        return;
+    //    }
+    //    await replyWithRetryOrPush(event, [{ type: "text", text: "ただいまご案内のご用意がありませんでした。" }]);
+    //    return;
+    //}
 
-    // text message
-    if (event.type === "message" && event.message?.type === "text" && event.replyToken) {
-        if (!(await tapGuardAccept(userKey, event.message.text))) {
-            logger.info({ rid, eventId, userKey, text: event.message.text, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate tap");
-            return;
-        }
-        const msgs = await routeMessage(event.message.text.trim(), event);
-        if (msgs) {
-            await replyWithRetryOrPush(event, msgs);
-        } else {
-            await replyWithRetryOrPush(event, withQuickReply(
-                [{ type: "text", text: "ご質問ありがとうございます。メニューからもお選びいただけます。" }]
-            ));
-        }
-        return;
-    }
+    //// text message
+    //if (event.type === "message" && event.message?.type === "text" && event.replyToken) {
+    //    if (!(await tapGuardAccept(userKey, event.message.text))) {
+    //        logger.info({ rid, eventId, userKey, text: event.message.text, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate tap");
+    //        return;
+    //    }
+    //    const msgs = await routeMessage(event.message.text.trim(), event);
+    //    if (msgs)
+    //    {
+    //        await replyWithRetryOrPush(event, msgs);
+    //    }
+    //    //} else {
+    //    //    await replyWithRetryOrPush(event, withQuickReply(
+    //    //        [{ type: "text", text: "ご質問ありがとうございます。メニューからもお選びいただけます。" }]
+    //    //    ));
+    //    //}
+    //    return;
+    //}
 
     // 未対応タイプは no-op
     logger.info({ rid, eventId, type: event.type }, "[Info] Unsupported event type -> no-op");
