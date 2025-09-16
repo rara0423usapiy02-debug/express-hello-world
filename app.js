@@ -1,78 +1,62 @@
-﻿// app.refactored.js - LINE Messaging API webhook（高速応答・分散タップ抑止・管理者自己登録／祝席向け文面・観測性強化）
+﻿// app.refactored.stable.js - LINE Messaging API webhook（高速応答・分散タップ抑止・管理者自己登録／祝席向け文面・観測性強化・安定化版）
 "use strict";
 
-/**
- * 改善ポイント（主な追加/変更）
- * - ★ undici 採用（HTTP/2/ALPN + Keep-Alive最適化）
- * - ★ FAST_HTTP_EARLY_200=true で「早返し」：HTTP 200 を即時返却し内部で処理継続
- * - HTTP/2/ALPN で RTT 短縮（100ms台に寄せる）
- * - ルーティングは非コマンド沈黙のまま（既定文面削除）
- * - Quick Reply の空配列を二重防御で抑止
- * - 429/5xx + Retry-After を尊重した指数バックオフ
- * - Redis 監視・安全終了、デデュープ/タップガード/レート制限
- * - /metrics に簡易 Basic 認証（任意）
- * - 署名検証の強化（失敗理由ログ）
- * - 観測性：Prometheus + 構造化ログ（相関ID、応答時間）
+/* ===== 主な強化点 =====
+ * - 0.0.0.0 bind / PORT 準拠
+ * - undici + AbortController による確実なタイムアウト
+ * - TOKEN 未設定時は送信APIをスキップ（ログのみ）
+ * - /health（軽量）と /ready（Redis ping 等）を分離
+ * - 未処理例外/拒否のログ化と継続
+ * - Quick Reply 13件上限順守
+ * - JSON body size 制限
  */
 
 const express = require("express");
 const { randomUUID, createHmac, timingSafeEqual } = require("crypto");
 const { Agent, fetch: undiciFetch } = require("undici");
-// 任意：DNS キャッシュ（有効化は環境変数で）
-let CacheableLookup;
-try { CacheableLookup = require("cacheable-lookup"); } catch { /* optional */ }
-
-// ---- pino は未インストールでも動くフォールバック ----
-let pino;
-try { pino = require("pino"); }
-catch { pino = () => ({ info: console.log, warn: console.warn, error: console.error, debug: console.log }); }
-
+let CacheableLookup; try { CacheableLookup = require("cacheable-lookup"); } catch {}
+let pino; try { pino = require("pino"); } catch { pino = () => ({ info: console.log, warn: console.warn, error: console.error, debug: console.log }); }
 const Redis = require("ioredis");
-const prom = require("prom-client"); // Prometheus
+const prom = require("prom-client");
 
 // ====== 環境変数 ======
 const PORT = Number(process.env.PORT || 3000);
-const TOKEN = process.env.LINE_ACCESS_TOKEN || ""; // 必須
-const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || ""; // 推奨
+const TOKEN = process.env.LINE_ACCESS_TOKEN || ""; // 未設定でも落とさない
+const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
 const STRICT_SIGNATURE = /^true$/i.test(process.env.STRICT_SIGNATURE || "false");
 
-const FAST_HTTP_EARLY_200 = !/^false$/i.test(process.env.FAST_HTTP_EARLY_200 || "true"); // 既定: 早返しON
+const FAST_HTTP_EARLY_200 = !/^false$/i.test(process.env.FAST_HTTP_EARLY_200 || "true");
 const TAP_DEBOUNCE_MS = Number(process.env.TAP_DEBOUNCE_MS || 1200);
 const DEDUPE_TTL_MS = Number(process.env.DEDUPE_TTL_MS || 5 * 60 * 1000);
 const RATE_CAP = Number(process.env.RATE_CAP || 10);
 const RATE_REFILL = Number(process.env.RATE_REFILL || 1);
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 5000); // undici connect/readの総合目安
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 5000); // 全体目安
 const DNS_CACHE_TTL = Number(process.env.DNS_CACHE_TTL || 0); // 0=無効, 秒
 
 const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
 const ADMIN_REG_TOKEN = process.env.ADMIN_REG_TOKEN || "";
 const REDIS_URL = process.env.REDIS_URL || "";
 
+const METRICS_USER = process.env.METRICS_USER || "";
+const METRICS_PASS = process.env.METRICS_PASS || "";
+
 // ====== ロガー ======
 let logger;
 try {
   logger = pino(process.env.NODE_ENV === "production" ? {} : { transport: { target: "pino-pretty" } });
-} catch {
-  logger = pino();
-}
+} catch { logger = pino(); }
 
 // ====== 起動前チェック ======
-if (!TOKEN) {
-  logger.error("[FATAL] LINE_ACCESS_TOKEN が未設定です。返信/Push は必ず失敗します。");
-}
-if (!CHANNEL_SECRET) {
-  logger.warn("[WARN] LINE_CHANNEL_SECRET 未設定。STRICT_SIGNATURE=true の場合は 403 返却。");
-}
+if (!TOKEN) logger.error("[WARN] LINE_ACCESS_TOKEN 未設定のため、Reply/Push は送信スキップします。");
+if (!CHANNEL_SECRET) logger.warn("[WARN] LINE_CHANNEL_SECRET 未設定。STRICT_SIGNATURE=true の場合 403 になります。");
 
 // ====== アプリ初期化 ======
 const app = express();
 
-// ====== 生ボディ保持（署名検証用） ======
-function rawBodySaver(req, _res, buf, encoding) {
-  if (buf && buf.length) req.rawBody = buf.toString(encoding || "utf8");
-}
-app.use(express.json({ verify: rawBodySaver }));
-app.use(express.urlencoded({ extended: true, verify: rawBodySaver }));
+// ====== 生ボディ保持（署名検証用）＋ サイズ制限 ======
+function rawBodySaver(req, _res, buf, encoding) { if (buf && buf.length) req.rawBody = buf.toString(encoding || "utf8"); }
+app.use(express.json({ verify: rawBodySaver, limit: process.env.BODY_LIMIT || "1mb" }));
+app.use(express.urlencoded({ extended: true, verify: rawBodySaver, limit: process.env.BODY_LIMIT || "1mb" }));
 
 // ====== 相関ID付与 ======
 app.use((req, res, next) => {
@@ -101,11 +85,7 @@ if (REDIS_URL) {
 }
 
 // ====== undici Agent（HTTP/2/ALPN, Keep-Alive, 任意DNSキャッシュ） ======
-const agentOpts = {
-  keepAliveTimeout: 60_000,
-  keepAliveMaxTimeout: 120_000,
-  connectTimeout: REQUEST_TIMEOUT_MS
-};
+const agentOpts = { keepAliveTimeout: 60_000, keepAliveMaxTimeout: 120_000, connectTimeout: REQUEST_TIMEOUT_MS };
 if (DNS_CACHE_TTL > 0 && CacheableLookup) {
   const cache = new CacheableLookup({ maxTtl: DNS_CACHE_TTL, errorTtl: 1, fallbackDuration: 0 });
   cache.install(require("dns"));
@@ -115,8 +95,17 @@ if (DNS_CACHE_TTL > 0 && CacheableLookup) {
   logger.warn("[BOOT] DNS cache requested but cacheable-lookup not installed. Skipping.");
 }
 const lineAgent = new Agent(agentOpts);
+
+// **Abort 付き fetch（確実なタイムアウト）**
+async function fetchWithTimeout(url, init = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(new Error("timeout")), timeoutMs);
+  try { return await undiciFetch(url, { ...init, signal: ac.signal }); }
+  finally { clearTimeout(t); }
+}
+
 async function lineFetch(path, { method = "GET", body, headers = {} } = {}) {
-  const res = await undiciFetch("https://api.line.me" + path, {
+  return fetchWithTimeout("https://api.line.me" + path, {
     method,
     body,
     dispatcher: lineAgent,
@@ -126,7 +115,6 @@ async function lineFetch(path, { method = "GET", body, headers = {} } = {}) {
       ...headers
     }
   });
-  return res;
 }
 
 // ====== Prometheus メトリクス ======
@@ -142,9 +130,7 @@ const now = () => Date.now();
 const elapsed = (t) => `${Date.now() - t}ms`;
 const toISO = (d = new Date()) => d.toISOString();
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const summarizeData = (data) => {
-  try { return JSON.stringify(data).slice(0, 300); } catch { return String(data).slice(0, 300); }
-};
+const summarizeData = (data) => { try { return JSON.stringify(data).slice(0, 300); } catch { return String(data).slice(0, 300); } };
 
 // ====== データ（サンプル応答） ======
 const rabbitImages = [
@@ -221,8 +207,10 @@ function withQuickReply(messages, items = []) {
   const compact = sanitizeMessages(messages);
   if (compact.length === 0) return compact;
   if (!Array.isArray(items) || items.length === 0) return compact;
+  // LINE Quick Reply items 上限は 13
   const qItems = items
     .filter(i => i && i.label && i.text)
+    .slice(0, 13)
     .map(i => ({ type: "action", action: { type: "message", label: i.label, text: i.text } }));
   if (qItems.length === 0) return compact;
   const [head, ...rest] = compact;
@@ -249,7 +237,6 @@ async function isAdmin(userId) {
 
 // ====== ルーター ======
 const routes = [
-  // 管理者：自己登録
   {
     match: /^admin[:\s]+register\s+(\S+)$/i,
     handle: async (_text, m, event) => {
@@ -262,7 +249,6 @@ const routes = [
       return [{ type: "text", text: "管理者として登録いたしました。いつもありがとうございます。" }];
     }
   },
-  // 管理者：解除
   {
     match: /^admin[:\s]+unregister$/i,
     handle: async (_text, _m, event) => {
@@ -272,7 +258,6 @@ const routes = [
       return [{ type: "text", text: "管理者登録を解除いたしました。引き続きよろしくお願いいたします。" }];
     }
   },
-  // 管理者：ステータス
   {
     match: /^admin[:\s]+(stats|status)$/i,
     handle: async (_text, _m, event) => {
@@ -294,7 +279,6 @@ const routes = [
       return [{ type: "text", text: "権限対象ではございません。" }];
     }
   },
-  // 一般機能
   { match: /^faq$/i, handle: async () => [createFaqListFlex()] },
   { match: /^faq:(.+)$/i, handle: async (_t, m) => { const key = m[1].trim(); return faqData[key] ? [createFaqAnswerFlex(key)] : null; } },
   { match: /\bhuku\b/i, handle: async () => createRandomRabbitImage() },
@@ -306,7 +290,7 @@ async function routeMessage(text, event) {
     const m = text.match(r.match);
     if (m) return await r.handle(text, m, event);
   }
-  return null; // ★ヒットしなければ沈黙
+  return null; // ヒットしなければ沈黙
 }
 
 // ====== 署名検証 ======
@@ -323,13 +307,20 @@ function validateSignature(req) {
 }
 
 // ====== 返信/Push（undici + リトライ） ======
+function ensureSendable() {
+  if (!TOKEN) {
+    logger.warn("[Reply/Push] skipped: LINE_ACCESS_TOKEN not set");
+    return false;
+  }
+  return true;
+}
+
 async function replyWithRetry(eventId, replyToken, rawMessages) {
   const start = now();
   const messages = stripEmptyQuickReply(sanitizeMessages(rawMessages));
-  if (messages.length === 0) {
-    logger.warn({ eventId }, "[Reply Skip] no-messages");
-    return;
-  }
+  if (messages.length === 0) { logger.warn({ eventId }, "[Reply Skip] no-messages"); return; }
+  if (!ensureSendable()) return;
+
   const maxAttempts = 4;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -347,15 +338,11 @@ async function replyWithRetry(eventId, replyToken, rawMessages) {
       logger.error({ eventId, attempt, status: resp.status, data: summarizeData(bodyText), elapsed: elapsed(start) }, "LINE Reply error");
       if (resp.status === 429 || (resp.status >= 500 && resp.status < 600)) {
         const backoff = retryAfterSec > 0 ? retryAfterSec * 1000 : Math.min(2000 * Math.pow(2, attempt - 1), 8000);
-        await sleep(backoff);
-        continue;
+        await sleep(backoff); continue;
       }
-      const err = new Error(`Reply failed ${resp.status}: ${bodyText}`);
-      err.response = { status: resp.status };
-      throw err;
+      const err = new Error(`Reply failed ${resp.status}: ${bodyText}`); err.response = { status: resp.status }; throw err;
     } catch (err) {
       if (attempt >= maxAttempts) throw err;
-      // ネットワーク断など → 少し待って再試行
       await sleep(Math.min(2000 * Math.pow(2, attempt - 1), 8000));
     }
   }
@@ -365,6 +352,8 @@ async function pushWithRetry(to, rawMessages) {
   const start = now();
   const messages = stripEmptyQuickReply(sanitizeMessages(rawMessages));
   if (messages.length === 0) return;
+  if (!ensureSendable()) return;
+
   const maxAttempts = 4;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -382,12 +371,9 @@ async function pushWithRetry(to, rawMessages) {
       logger.error({ to, attempt, status: resp.status, data: summarizeData(bodyText), elapsed: elapsed(start) }, "LINE Push error");
       if (resp.status === 429 || (resp.status >= 500 && resp.status < 600)) {
         const backoff = retryAfterSec > 0 ? retryAfterSec * 1000 : Math.min(2000 * Math.pow(2, attempt - 1), 8000);
-        await sleep(backoff);
-        continue;
+        await sleep(backoff); continue;
       }
-      const err = new Error(`Push failed ${resp.status}: ${bodyText}`);
-      err.response = { status: resp.status };
-      throw err;
+      const err = new Error(`Push failed ${resp.status}: ${bodyText}`); err.response = { status: resp.status }; throw err;
     } catch (err) {
       if (attempt >= maxAttempts) throw err;
       await sleep(Math.min(2000 * Math.pow(2, attempt - 1), 8000));
@@ -404,37 +390,18 @@ async function replyWithRetryOrPush(event, rawMessages) {
     if ((status >= 400 && status < 500) && event.source?.type === "user" && event.source.userId) {
       logger.warn({ eventId, status }, "Reply failed -> Push fallback");
       await pushWithRetry(event.source.userId, rawMessages);
-    } else {
-      throw e;
-    }
+    } else { throw e; }
   }
 }
 
 // ====== デデュープ（再配送/重複ID） ======
 const seenMem = new Map(); // id -> expireAt
-setInterval(() => {
-  if (redis) return;
-  const t = now();
-  for (const [k, v] of seenMem.entries()) if (v <= t) seenMem.delete(k);
-}, 60 * 1000).unref();
-
-function eventKey(e) {
-  if (e.webhookEventId) return `id:${e.webhookEventId}`;
-  return `${e.type}:${e.message?.id || ""}:${e.timestamp || ""}`;
-}
-
+setInterval(() => { if (redis) return; const t = now(); for (const [k, v] of seenMem.entries()) if (v <= t) seenMem.delete(k); }, 60 * 1000).unref();
+function eventKey(e) { if (e.webhookEventId) return `id:${e.webhookEventId}`; return `${e.type}:${e.message?.id || ""}:${e.timestamp || ""}`; }
 async function isDuplicate(event) {
   const key = eventKey(event);
-  if (redis) {
-    const ok = await redis.set(`dedupe:${key}`, "1", "PX", DEDUPE_TTL_MS, "NX");
-    return ok !== "OK";
-  } else {
-    const t = now();
-    const exp = seenMem.get(key);
-    if (exp && exp > t) return true;
-    seenMem.set(key, t + DEDUPE_TTL_MS);
-    return false;
-  }
+  if (redis) { const ok = await redis.set(`dedupe:${key}`, "1", "PX", DEDUPE_TTL_MS, "NX"); return ok !== "OK"; }
+  else { const t = now(); const exp = seenMem.get(key); if (exp && exp > t) return true; seenMem.set(key, t + DEDUPE_TTL_MS); return false; }
 }
 function seenSize() { return redis ? -1 : seenMem.size; }
 
@@ -448,27 +415,18 @@ function safeLogEvent(e, rid) {
 
 // ====== ダブルタップ抑止（タップガード） ======
 const tapMem = new Map(); // mapKey -> expireAt
-setInterval(() => {
-  if (redis) return;
-  const t = Date.now();
-  for (const [k, exp] of tapMem.entries()) if (exp <= t) tapMem.delete(k);
-}, 60 * 1000).unref();
-
+setInterval(() => { if (redis) return; const t = Date.now(); for (const [k, exp] of tapMem.entries()) if (exp <= t) tapMem.delete(k); }, 60 * 1000).unref();
 function normalizePayloadText(s) { return String(s || "").trim().toLowerCase(); }
 async function tapGuardAccept(userOrGroupKey, payloadText) {
   const norm = normalizePayloadText(payloadText);
   const mapKey = `${userOrGroupKey}|${norm}`;
   if (redis) {
     const ok = await redis.set(`tap:${mapKey}`, "1", "PX", TAP_DEBOUNCE_MS, "NX");
-    const accept = ok === "OK";
-    if (!accept) tapGuardBlockCounter.inc();
-    return accept;
+    const accept = ok === "OK"; if (!accept) tapGuardBlockCounter.inc(); return accept;
   } else {
-    const t = Date.now();
-    const exp = tapMem.get(mapKey);
+    const t = Date.now(); const exp = tapMem.get(mapKey);
     if (exp && exp > t) { tapGuardBlockCounter.inc(); return false; }
-    tapMem.set(mapKey, t + TAP_DEBOUNCE_MS);
-    return true;
+    tapMem.set(mapKey, t + TAP_DEBOUNCE_MS); return true;
   }
 }
 function tapGuardSize() { return redis ? -1 : tapMem.size; }
@@ -480,13 +438,8 @@ function allowRate(key) {
   const cur = rate.get(key) || { tokens: RATE_CAP, updatedAt: nowSec };
   const refill = (nowSec - cur.updatedAt) * RATE_REFILL;
   const tokens = Math.min(RATE_CAP, cur.tokens + refill);
-  if (tokens < 1) {
-    rate.set(key, { tokens, updatedAt: nowSec });
-    rateLimitBlockCounter.inc();
-    return false;
-  }
-  rate.set(key, { tokens: tokens - 1, updatedAt: nowSec });
-  return true;
+  if (tokens < 1) { rate.set(key, { tokens, updatedAt: nowSec }); rateLimitBlockCounter.inc(); return false; }
+  rate.set(key, { tokens: tokens - 1, updatedAt: nowSec }); return true;
 }
 
 // ====== キュー制御（per-key 直列実行） ======
@@ -500,7 +453,7 @@ function keyFromEvent(e) {
 function lockPerKeyAndRun(key, taskFn) {
   const prev = perKeyQueue.get(key) || Promise.resolve();
   const run = prev
-    .catch(() => { /* 直前のエラーは握りつぶして続行 */ })
+    .catch(() => {}) // 直前のエラーは握りつぶして続行
     .then(() => taskFn())
     .finally(() => { if (perKeyQueue.get(key) === run) perKeyQueue.delete(key); });
   perKeyQueue.set(key, run);
@@ -511,35 +464,20 @@ function lockPerKeyAndRun(key, taskFn) {
 async function processEvent(event, rid) {
   const eventId = event.webhookEventId || "no-id";
 
-  if (event?.deliveryContext?.isRedelivery) {
-    logger.info({ rid, eventId }, "[Skip] Redelivery");
-    return;
-  }
-  if (await isDuplicate(event)) {
-    logger.info({ rid, eventId }, "[Skip] Duplicate");
-    return;
-  }
+  if (event?.deliveryContext?.isRedelivery) { logger.info({ rid, eventId }, "[Skip] Redelivery"); return; }
+  if (await isDuplicate(event)) { logger.info({ rid, eventId }, "[Skip] Duplicate"); return; }
 
   const userKey = keyFromEvent(event);
-  if (!allowRate(userKey)) {
-    logger.warn({ rid, eventId, userKey }, "[RateLimit] Too many requests");
-    return;
-  }
+  if (!allowRate(userKey)) { logger.warn({ rid, eventId, userKey }, "[RateLimit] Too many requests"); return; }
 
   safeLogEvent(event, rid);
 
-  // follow は無返信（既定メッセージなし）
-  if (event.type === "follow") {
-    logger.info({ rid, eventId }, "[Info] follow event -> no-op");
-    return;
-  }
+  if (event.type === "follow") { logger.info({ rid, eventId }, "[Info] follow event -> no-op"); return; }
 
-  // postback：必要があれば個別ルーティング。未定義は沈黙
   if (event.type === "postback") {
     const data = String(event.postback?.data || "");
     if (!(await tapGuardAccept(userKey, data))) {
-      logger.info({ rid, eventId, userKey, data, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate postback");
-      return;
+      logger.info({ rid, eventId, userKey, data, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate postback"); return;
     }
     if (data.startsWith("faq:")) {
       const key = decodeURIComponent(data.slice(4));
@@ -549,51 +487,48 @@ async function processEvent(event, rid) {
     return;
   }
 
-  // text message：コマンドにヒットしたときのみ返信。非コマンドは沈黙。
   if (event.type === "message" && event.message?.type === "text" && event.replyToken) {
     if (!(await tapGuardAccept(userKey, event.message.text))) {
-      logger.info({ rid, eventId, userKey, text: event.message.text, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate tap");
-      return;
+      logger.info({ rid, eventId, userKey, text: event.message.text, windowMs: TAP_DEBOUNCE_MS }, "[TapGuard] duplicate tap"); return;
     }
     const msgs = await routeMessage(event.message.text.trim(), event);
-    if (msgs && msgs.length > 0) {
-      await replyWithRetryOrPush(event, msgs);
-    }
+    if (msgs && msgs.length > 0) { await replyWithRetryOrPush(event, msgs); }
     return;
   }
 
   logger.info({ rid, eventId, type: event.type }, "[Info] Unsupported event type -> no-op");
 }
 
-// ====== 健康チェック/疎通/メトリクス ======
+// ====== 健康チェック/レディネス/メトリクス ======
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/webhook", (_req, res) => res.status(200).send("webhook ok"));
-app.get("/health", async (_req, res) => {
+app.get("/health", (_req, res) => {
   const mem = process.memoryUsage();
-  const health = {
-    ok: true,
-    ts: toISO(),
-    uptimeSec: Math.floor(process.uptime()),
-    perKeyQueues: perKeyQueue.size,
-    seenCacheSize: seenSize(),
-    tapGuardSize: tapGuardSize(),
-    tapWindowMs: TAP_DEBOUNCE_MS,
-    rateEntries: rate.size,
-    redis: !!redis,
+  res.status(200).json({
+    ok: true, ts: toISO(), uptimeSec: Math.floor(process.uptime()),
+    perKeyQueues: perKeyQueue.size, seenCacheSize: seenSize(), tapGuardSize: tapGuardSize(),
+    tapWindowMs: TAP_DEBOUNCE_MS, rateEntries: rate.size, redis: !!redis,
     memory: { rssMB: +(mem.rss / 1024 / 1024).toFixed(1), heapUsedMB: +(mem.heapUsed / 1024 / 1024).toFixed(1) },
     early200: FAST_HTTP_EARLY_200,
-  };
-  res.status(200).json(health);
+  });
 });
-
-// /metrics に簡易 Basic 認証（METRICS_USER/PASS 設定時のみ）
-const METRICS_USER = process.env.METRICS_USER || "";
-const METRICS_PASS = process.env.METRICS_PASS || "";
+app.get("/ready", async (_req, res) => {
+  try {
+    if (redis) { await redis.ping(); }
+    return res.status(200).json({ ready: true, redis: !!redis });
+  } catch (e) {
+    logger.warn({ err: String(e) }, "[Ready] dependency not ready");
+    return res.status(503).json({ ready: false, error: String(e) });
+  }
+});
+// /metrics（Basic 認証任意）
 app.get("/metrics", async (req, res) => {
   if (METRICS_USER && METRICS_PASS) {
     const hdr = req.headers.authorization || "";
-    const token = hdr.startsWith("Basic ") ? hdr.slice(6) : "";
-    const [u, p] = token ? Buffer.from(token, "base64").toString().split(":") : ["", ""];
+    let u = "", p = "";
+    if (hdr.startsWith("Basic ")) {
+      try { [u, p] = Buffer.from(hdr.slice(6), "base64").toString().split(":"); } catch { /* noop */ }
+    }
     if (u !== METRICS_USER || p !== METRICS_PASS) return res.status(401).set("WWW-Authenticate", "Basic realm=metrics").end();
   }
   res.set("Content-Type", prom.register.contentType);
@@ -611,18 +546,13 @@ app.post("/webhook", async (req, res) => {
   }
 
   const events = Array.isArray(req.body?.events) ? req.body.events : [];
-  if (events.length === 0) {
-    logger.info({ rid }, "[Webhook] No events");
-    return res.sendStatus(200);
-  }
+  if (events.length === 0) { logger.info({ rid }, "[Webhook] No events"); return res.sendStatus(200); }
 
   const endTimer = webhookHist.startTimer();
   const start = now();
 
   if (FAST_HTTP_EARLY_200) {
-    // 早返し：200 を即時返却してバックグラウンド処理
     res.sendStatus(200);
-    // 別キーは並列、同一キーは直列。処理は HTTP 応答と独立。
     queueMicrotask(async () => {
       try {
         const tasks = events.map(ev => lockPerKeyAndRun(keyFromEvent(ev), () => processEvent(ev, rid)));
@@ -635,7 +565,6 @@ app.post("/webhook", async (req, res) => {
       }
     });
   } else {
-    // 互換：同期逐次 -> 完了後に200
     try {
       for (const ev of events) {
         const key = keyFromEvent(ev);
@@ -654,17 +583,22 @@ app.post("/webhook", async (req, res) => {
 });
 
 // ====== 起動/終了 ======
-const server = app.listen(PORT, () => { logger.info(`Server running at http://localhost:${PORT}`); });
+const server = app.listen(PORT, "0.0.0.0", () => { logger.info(`Server running at http://0.0.0.0:${PORT}`); });
 
 function shutdown(code = 0) {
   logger.info("[Shutdown] closing server...");
+  // 猶予15s（キュー中処理の完了を待ちやすく）
+  const force = setTimeout(() => { logger.warn("[Shutdown] force exit after timeout"); process.exit(code); }, 15000).unref();
   server.close(async () => {
     try { if (redis) await redis.quit(); } catch (e) { logger.warn({ e: String(e) }, "[Shutdown] redis.quit error"); }
+    clearTimeout(force);
     logger.info("[Shutdown] closed. Bye.");
     process.exit(code);
   });
-  setTimeout(() => process.exit(code), 5000).unref();
 }
 
 process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
+// 落ちない方針：ログだけ出して継続（必要なら exit(1) に変更）
+process.on("unhandledRejection", (r) => logger.error({ err: String(r) }, "[Warn] unhandledRejection"));
+process.on("uncaughtException", (e) => logger.error({ err: String(e?.stack || e) }, "[Fatal] uncaughtException"));
